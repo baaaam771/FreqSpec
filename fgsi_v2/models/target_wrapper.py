@@ -141,7 +141,8 @@ if __name__ == "__main__":
         # 실제 SD-Inpainting 로드 (5GB 다운로드)
         tw = TargetWrapper(
             # model_id="stabilityai/stable-diffusion-2-inpainting",
-            model_id="sd2-community/stable-diffusion-2-inpainting",
+            # model_id="sd2-community/stable-diffusion-2-inpainting",
+            model_id= "/mnt/HDD_12TB/bam_ki/checkpoints/stable-diffusion-2-inpainting",
             device=device,
         )
     else:
