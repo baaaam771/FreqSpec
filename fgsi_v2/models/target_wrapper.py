@@ -134,32 +134,32 @@ class TargetWrapper(nn.Module):
         return eps.to(z_t.dtype)
 
 
-# if __name__ == "__main__":
-#     import sys
-#     device = "cuda" if len(sys.argv) > 1 and sys.argv[1] == "real" else "cpu"
-#     if device == "cuda":
-#         # 실제 SD-Inpainting 로드 (5GB 다운로드)
-#         tw = TargetWrapper(
-#             model_id="stabilityai/stable-diffusion-2-inpainting",
-#             device=device,
-#         )
-#     else:
-#         # dummy 테스트
-#         tw = TargetWrapper(model_id="dummy/none")
-    
-#     z = torch.randn(1, 4, 32, 32, device=device)
-#     cond = torch.randn(1, 4, 32, 32, device=device)
-#     mask = (torch.rand(1, 1, 32, 32, device=device) > 0.7).float()
-#     t = torch.tensor([500], device=device)
-#     out = tw.predict_eps(z, t, cond, mask)
-#     print(f"eps: {out.shape}, available={tw.available}")
-
 if __name__ == "__main__":
-    # dummy mode test
-    tw = TargetWrapper(model_id="dummy/none")
-    z = torch.randn(1, 4, 32, 32)
-    cond = torch.randn(1, 4, 32, 32)
-    mask = (torch.rand(1, 1, 32, 32) > 0.7).float()
-    t = torch.tensor([500])
+    import sys
+    device = "cuda" if len(sys.argv) > 1 and sys.argv[1] == "real" else "cpu"
+    if device == "cuda":
+        # 실제 SD-Inpainting 로드 (5GB 다운로드)
+        tw = TargetWrapper(
+            model_id="stabilityai/stable-diffusion-2-inpainting",
+            device=device,
+        )
+    else:
+        # dummy 테스트
+        tw = TargetWrapper(model_id="dummy/none")
+    
+    z = torch.randn(1, 4, 32, 32, device=device)
+    cond = torch.randn(1, 4, 32, 32, device=device)
+    mask = (torch.rand(1, 1, 32, 32, device=device) > 0.7).float()
+    t = torch.tensor([500], device=device)
     out = tw.predict_eps(z, t, cond, mask)
-    print(f"dummy eps: {out.shape}")
+    print(f"eps: {out.shape}, available={tw.available}")
+
+# if __name__ == "__main__":
+#     # dummy mode test
+#     tw = TargetWrapper(model_id="dummy/none")
+#     z = torch.randn(1, 4, 32, 32)
+#     cond = torch.randn(1, 4, 32, 32)
+#     mask = (torch.rand(1, 1, 32, 32) > 0.7).float()
+#     t = torch.tensor([500])
+#     out = tw.predict_eps(z, t, cond, mask)
+#     print(f"dummy eps: {out.shape}")
