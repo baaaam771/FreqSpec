@@ -81,23 +81,30 @@ class TargetWrapper(nn.Module):
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
         """image in [-1,1] -> latent. [B,3,H,W] -> [B,4,H/8,W/8]"""
         if not self._available:
-            return image  # dummy
+            # Dummy mode: 가짜 latent (3채널 -> 4채널, /8 다운샘플)
+            B, _, H, W = image.shape
+            z = F.interpolate(image, size=(H // 8, W // 8), mode="bilinear", align_corners=False)
+            # 채널을 3 -> 4로 확장 (간단히 평균을 4번째 채널로)
+            z4 = torch.cat([z, z.mean(dim=1, keepdim=True)], dim=1)
+            return z4
         z = self.vae.encode(image.to(self.dtype)).latent_dist.sample()
         return z * self.vae_scaling
 
     @torch.no_grad()
     def decode_latent(self, z: torch.Tensor) -> torch.Tensor:
         if not self._available:
-            return z
+            # Dummy: 4채널 latent -> 3채널 픽셀, 8배 업샘플
+            B, _, h, w = z.shape
+            z3 = z[:, :3]  # 첫 3채널만
+            return F.interpolate(z3, size=(h * 8, w * 8), mode="bilinear", align_corners=False).clamp(-1, 1)
         x = self.vae.decode(z.to(self.dtype) / self.vae_scaling).sample
         return x.clamp(-1, 1)
 
     def downsample_mask(self, mask_pix: torch.Tensor) -> torch.Tensor:
         """[B,1,H,W] mask -> latent resolution by nearest."""
-        if self.vae_ds == 1:
-            return mask_pix
-        return F.interpolate(mask_pix, scale_factor=1.0 / self.vae_ds, mode="nearest")
-
+        # 항상 8배 다운샘플 (dummy든 진짜든 통일)
+        return F.interpolate(mask_pix, scale_factor=1.0 / 8, mode="nearest")
+    
     @torch.no_grad()
     def predict_eps(
         self,
@@ -127,22 +134,32 @@ class TargetWrapper(nn.Module):
         return eps.to(z_t.dtype)
 
 
-if __name__ == "__main__":
-    import sys
-    device = "cuda" if len(sys.argv) > 1 and sys.argv[1] == "real" else "cpu"
-    if device == "cuda":
-        # 실제 SD-Inpainting 로드 (5GB 다운로드)
-        tw = TargetWrapper(
-            model_id="stabilityai/stable-diffusion-2-inpainting",
-            device=device,
-        )
-    else:
-        # dummy 테스트
-        tw = TargetWrapper(model_id="dummy/none")
+# if __name__ == "__main__":
+#     import sys
+#     device = "cuda" if len(sys.argv) > 1 and sys.argv[1] == "real" else "cpu"
+#     if device == "cuda":
+#         # 실제 SD-Inpainting 로드 (5GB 다운로드)
+#         tw = TargetWrapper(
+#             model_id="stabilityai/stable-diffusion-2-inpainting",
+#             device=device,
+#         )
+#     else:
+#         # dummy 테스트
+#         tw = TargetWrapper(model_id="dummy/none")
     
-    z = torch.randn(1, 4, 32, 32, device=device)
-    cond = torch.randn(1, 4, 32, 32, device=device)
-    mask = (torch.rand(1, 1, 32, 32, device=device) > 0.7).float()
-    t = torch.tensor([500], device=device)
+#     z = torch.randn(1, 4, 32, 32, device=device)
+#     cond = torch.randn(1, 4, 32, 32, device=device)
+#     mask = (torch.rand(1, 1, 32, 32, device=device) > 0.7).float()
+#     t = torch.tensor([500], device=device)
+#     out = tw.predict_eps(z, t, cond, mask)
+#     print(f"eps: {out.shape}, available={tw.available}")
+
+if __name__ == "__main__":
+    # dummy mode test
+    tw = TargetWrapper(model_id="dummy/none")
+    z = torch.randn(1, 4, 32, 32)
+    cond = torch.randn(1, 4, 32, 32)
+    mask = (torch.rand(1, 1, 32, 32) > 0.7).float()
+    t = torch.tensor([500])
     out = tw.predict_eps(z, t, cond, mask)
-    print(f"eps: {out.shape}, available={tw.available}")
+    print(f"dummy eps: {out.shape}")
