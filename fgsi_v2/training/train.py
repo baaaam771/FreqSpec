@@ -58,18 +58,42 @@ def random_inpaint_mask(B, H, W, device, p_box=0.4):
 
 
 class ImageDataset(Dataset):
+    """
+    재귀 dataset: root 아래의 모든 .jpg/.jpeg/.png/.webp를 평평하게 모은다.
+    Places2 같은 다층 폴더 구조에도 그대로 대응.
+    Inpainting에는 class label이 필요 없으므로 ImageFolder 대신 직접 구현.
+    """
     def __init__(self, root, image_size=512):
-        self.ds = datasets.ImageFolder(
-            root,
-            transform=transforms.Compose([
-                transforms.Resize(image_size),
-                transforms.CenterCrop(image_size),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5] * 3, [0.5] * 3),
-            ]),
-        )
-    def __len__(self): return len(self.ds)
-    def __getitem__(self, i): return self.ds[i][0]
+        from PIL import Image as _PILImage
+        self._PIL = _PILImage
+        self.root = root
+        exts = (".jpg", ".jpeg", ".png", ".webp",
+                ".JPG", ".JPEG", ".PNG", ".WEBP")
+        self.paths = []
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                if fn.endswith(exts):
+                    self.paths.append(os.path.join(dirpath, fn))
+        if len(self.paths) == 0:
+            raise RuntimeError(f"No images found under {root}")
+        print(f"[ImageDataset] found {len(self.paths)} images under {root}")
+        self.tf = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5] * 3, [0.5] * 3),
+        ])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, i):
+        try:
+            img = self._PIL.open(self.paths[i]).convert("RGB")
+            return self.tf(img)
+        except Exception:
+            # 깨진 파일 만나면 다음 인덱스 시도
+            return self.__getitem__((i + 1) % len(self.paths))
 
 
 def train(args):

@@ -64,11 +64,28 @@ def fgsr_inpaint(
     boundary_weight: float = 1.0,
     dwt=None,
     verbose: bool = False,
+    # CFG / blending
+    guidance_scale: float = 1.0,
+    cond_emb=None,
+    uncond_emb=None,
+    known_z=None,
+    blend_known: bool = True,
 ):
     """
     Returns:
         z_final, stats
     """
+    def _blend(z_now, t_next_int):
+        """Re-impose known (non-hole) region at step t_next via q_sample."""
+        if not (blend_known and known_z is not None and t_next_int >= 0):
+            return z_now
+        B_ = z_now.shape[0]
+        eps_noise = torch.randn_like(known_z)
+        z_known_t = scheduler.q_sample(
+            known_z, eps_noise,
+            torch.full((B_,), t_next_int, device=z_now.device, dtype=torch.long))
+        return mask_z * z_now + (1 - mask_z) * z_known_t
+
     device = z_init.device
     if dwt is None:
         dwt = DWT2D("haar").to(device)
@@ -97,9 +114,14 @@ def fgsr_inpaint(
 
         # ---------------- Phase 1: stabilization ----------------
         if t_norm > t_spec_start_norm:
-            eps_t = target.predict_eps(z, t_tensor, cond_z, mask_z)
+            eps_t = target.predict_eps(
+                z, t_tensor, cond_z, mask_z,
+                cond_emb=cond_emb, uncond_emb=uncond_emb,
+                guidance_scale=guidance_scale,
+            )
             target_calls += 1
             z, _ = scheduler.ddim_step(z, eps_t, t_cur, t_prev)
+            z = _blend(z, t_prev)
             stab_steps += 1
             if verbose:
                 print(f"[stab] i={i} t={t_cur} (target only)")
@@ -117,16 +139,19 @@ def fgsr_inpaint(
         tol_patch = tol_low + (tol_high - tol_low) * (1 - sal_patch)
 
         # (b) target + draft eps at current step
-        eps_t = target.predict_eps(z, t_tensor, cond_z, mask_z)
+        eps_t = target.predict_eps(
+            z, t_tensor, cond_z, mask_z,
+            cond_emb=cond_emb, uncond_emb=uncond_emb,
+            guidance_scale=guidance_scale,
+        )
         target_calls += 1
         eps_d = draft(z, t_tensor, cond_z, mask_z)
         draft_calls += 1
 
         # (c) per-patch agreement and accept decision
         a_patch = patch_agreement(eps_d, eps_t, patch_size, beta)
-        accept_patch = (a_patch > (1 - tol_patch)).float()  # [B,1,Hp,Wp]
+        accept_patch = (a_patch > (1 - tol_patch)).float()
 
-        # 마스크 외부 patch는 어차피 보존되므로 강제 accept (계산 절약)
         mask_patch = F.max_pool2d(mask_z, patch_size, stride=patch_size)
         accept_patch = torch.where(mask_patch < 0.5,
                                    torch.ones_like(accept_patch),
@@ -139,14 +164,11 @@ def fgsr_inpaint(
         total_accepted += n_acc
         accept_rate = n_acc / max(n_patches, 1)
 
-        # (d) DDIM step with selective eps
-        # accept = draft eps 사용, reject = target eps 사용
         eps_mix = accept_full * eps_d + (1 - accept_full) * eps_t
         z_next, _ = scheduler.ddim_step(z, eps_mix, t_cur, t_prev)
+        z_next = _blend(z_next, t_prev)
 
-        # (e) accept rate가 높으면 draft로 K step 추가 진행 (target 호출 절약)
         if accept_rate > 0.6 and K > 1 and (i + K) <= N:
-            # 추가 K-1 step을 draft 단독으로 진행 (이미 1 step은 위에서 진행됨)
             z = z_next
             for k in range(1, K):
                 if (i + k + 1) > N: break
@@ -155,14 +177,12 @@ def fgsr_inpaint(
                 t_tensor_k = torch.full((B,), t_cur_k, device=device, dtype=torch.long)
                 eps_d_k = draft(z, t_tensor_k, cond_z, mask_z)
                 draft_calls += 1
-                # 마스크 외부는 그대로 두기 위해 hole 영역에만 적용
                 z_step, _ = scheduler.ddim_step(z, eps_d_k, t_cur_k, t_prev_k)
-                z = z_step
-            advanced_k = K
+                z = _blend(z_step, t_prev_k)
             if verbose:
                 print(f"[spec-K] i={i}..{i+K-1} t={t_cur} "
                       f"accept={accept_rate:.2f}")
-            i += advanced_k
+            i += K
         else:
             z = z_next
             if verbose:
@@ -183,10 +203,18 @@ def fgsr_inpaint(
 
 
 # ============================================================
-# Baseline: target-only DDIM
+# Baseline: target-only DDIM with optional CFG and mask-blending
 # ============================================================
 @torch.no_grad()
-def baseline_inpaint(target, z_init, cond_z, mask_z, scheduler, num_inference_steps=50):
+def baseline_inpaint(target, z_init, cond_z, mask_z, scheduler,
+                     num_inference_steps=50, guidance_scale=1.0,
+                     cond_emb=None, uncond_emb=None,
+                     known_z=None, blend_known=True):
+    """
+    Args:
+        known_z: clean latent of known (non-hole) region. If provided and blend_known=True,
+                 we re-impose it at every step (standard inpainting blending trick).
+    """
     ts = scheduler.get_ddim_schedule(num_inference_steps)
     N = len(ts)
     z = z_init.clone()
@@ -195,8 +223,22 @@ def baseline_inpaint(target, z_init, cond_z, mask_z, scheduler, num_inference_st
         t_cur = int(ts[i].item())
         t_prev = int(ts[i + 1].item()) if (i + 1) < N else -1
         t_tensor = torch.full((B,), t_cur, device=z.device, dtype=torch.long)
-        eps_t = target.predict_eps(z, t_tensor, cond_z, mask_z)
+
+        eps_t = target.predict_eps(
+            z, t_tensor, cond_z, mask_z,
+            cond_emb=cond_emb, uncond_emb=uncond_emb,
+            guidance_scale=guidance_scale,
+        )
         z, _ = scheduler.ddim_step(z, eps_t, t_cur, t_prev)
+
+        # Re-impose known (non-hole) region: q_sample(z_0_known, t_prev)
+        if blend_known and known_z is not None and t_prev >= 0:
+            eps_noise = torch.randn_like(known_z)
+            z_known_t = scheduler.q_sample(known_z, eps_noise,
+                                           torch.full((B,), t_prev, device=z.device,
+                                                      dtype=torch.long))
+            z = mask_z * z + (1 - mask_z) * z_known_t
+
     return z, {"target_calls": N, "nfe_total": N, "accept_rate": None}
 
 

@@ -107,14 +107,28 @@ def main(args):
                             target_size=(args.image_size, args.image_size))
     save_gray(sal, os.path.join(args.out_dir, "saliency.png"))
 
-    # init noise (마스크 내부만)
+    # SD-Inpainting 표준 방식: fully noisy z_init from scratch
+    # (마스크 외부 보존은 매 step의 blending으로 처리)
     z_init = torch.randn_like(z0)
-    z_init = z_init * mask_z + z0 * (1 - mask_z)
+
+    # Text embeddings (for CFG)
+    if target.available:
+        cond_emb, uncond_emb, use_cfg = target.get_text_embeddings(
+            args.prompt, batch_size=z0.shape[0], guidance_scale=args.guidance_scale
+        )
+        print(f"[inference] CFG={'on' if use_cfg else 'off'} guidance={args.guidance_scale} prompt='{args.prompt}'")
+    else:
+        cond_emb, uncond_emb = None, None
 
     # ---- baseline ----
     t0 = time.time()
-    z_base, s_base = baseline_inpaint(target, z_init.clone(), cond_z, mask_z, sch,
-                                       num_inference_steps=args.num_steps)
+    z_base, s_base = baseline_inpaint(
+        target, z_init.clone(), cond_z, mask_z, sch,
+        num_inference_steps=args.num_steps,
+        guidance_scale=args.guidance_scale,
+        cond_emb=cond_emb, uncond_emb=uncond_emb,
+        known_z=z0, blend_known=True,
+    )
     t_base = time.time() - t0
 
     # ---- FGSR ----
@@ -128,6 +142,9 @@ def main(args):
         tol_low=args.tol_low, tol_high=args.tol_high,
         boundary_weight=args.boundary_weight,
         dwt=dwt, verbose=args.verbose,
+        guidance_scale=args.guidance_scale,
+        cond_emb=cond_emb, uncond_emb=uncond_emb,
+        known_z=z0, blend_known=True,
     )
     t_spec = time.time() - t0
 
@@ -162,6 +179,10 @@ def get_parser():
     p.add_argument("--out_dir", type=str, default="./results")
     p.add_argument("--image_size", type=int, default=512)
     p.add_argument("--num_steps", type=int, default=50)
+    p.add_argument("--prompt", type=str, default="",
+                   help="Text prompt for CFG. Empty = unconditional.")
+    p.add_argument("--guidance_scale", type=float, default=7.5,
+                   help="CFG guidance scale. 1.0 = no CFG (faster, lower quality).")
     p.add_argument("--K", type=int, default=3)
     p.add_argument("--patch", type=int, default=4)
     p.add_argument("--t_spec_start", type=float, default=0.7)
