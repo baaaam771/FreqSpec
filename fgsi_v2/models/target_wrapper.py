@@ -66,45 +66,61 @@ class TargetWrapper(nn.Module):
         return self._available
 
     @torch.no_grad()
+    def _encode_prompt(self, prompts):
+        """Tokenize and encode a list of prompts."""
+        if not self._available:
+            return None
+        tokens = self.tokenizer(
+            prompts,
+            padding="max_length", max_length=self.tokenizer.model_max_length,
+            truncation=True, return_tensors="pt",
+        ).input_ids.to(self.device)
+        return self.text_encoder(tokens)[0]
+
+    @torch.no_grad()
     def _get_uncond_embedding(self, batch_size: int):
-        """Cached empty-prompt text embedding for unconditional inpainting."""
+        """Cached empty-prompt text embedding (for unconditional branch / no-CFG)."""
         if self._uncond_emb is None or self._uncond_emb.shape[0] != batch_size:
-            tokens = self.tokenizer(
-                [""] * batch_size,
-                padding="max_length", max_length=self.tokenizer.model_max_length,
-                truncation=True, return_tensors="pt",
-            ).input_ids.to(self.device)
-            self._uncond_emb = self.text_encoder(tokens)[0]
+            self._uncond_emb = self._encode_prompt([""] * batch_size)
         return self._uncond_emb
+
+    @torch.no_grad()
+    def get_text_embeddings(self, prompt: str, batch_size: int, guidance_scale: float):
+        """
+        Returns:
+            cond_emb:   [B, L, D] conditional text embedding (or None if CFG off)
+            uncond_emb: [B, L, D] unconditional (empty prompt) embedding
+            use_cfg: bool
+        """
+        if not self._available:
+            return None, None, False
+        uncond_emb = self._get_uncond_embedding(batch_size)
+        if guidance_scale > 1.0 and prompt:
+            cond_emb = self._encode_prompt([prompt] * batch_size)
+            return cond_emb, uncond_emb, True
+        return None, uncond_emb, False
 
     @torch.no_grad()
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
         """image in [-1,1] -> latent. [B,3,H,W] -> [B,4,H/8,W/8]"""
         if not self._available:
-            # Dummy mode: 가짜 latent (3채널 -> 4채널, /8 다운샘플)
-            B, _, H, W = image.shape
-            z = F.interpolate(image, size=(H // 8, W // 8), mode="bilinear", align_corners=False)
-            # 채널을 3 -> 4로 확장 (간단히 평균을 4번째 채널로)
-            z4 = torch.cat([z, z.mean(dim=1, keepdim=True)], dim=1)
-            return z4
+            return image  # dummy
         z = self.vae.encode(image.to(self.dtype)).latent_dist.sample()
         return z * self.vae_scaling
 
     @torch.no_grad()
     def decode_latent(self, z: torch.Tensor) -> torch.Tensor:
         if not self._available:
-            # Dummy: 4채널 latent -> 3채널 픽셀, 8배 업샘플
-            B, _, h, w = z.shape
-            z3 = z[:, :3]  # 첫 3채널만
-            return F.interpolate(z3, size=(h * 8, w * 8), mode="bilinear", align_corners=False).clamp(-1, 1)
+            return z
         x = self.vae.decode(z.to(self.dtype) / self.vae_scaling).sample
         return x.clamp(-1, 1)
 
     def downsample_mask(self, mask_pix: torch.Tensor) -> torch.Tensor:
         """[B,1,H,W] mask -> latent resolution by nearest."""
-        # 항상 8배 다운샘플 (dummy든 진짜든 통일)
-        return F.interpolate(mask_pix, scale_factor=1.0 / 8, mode="nearest")
-    
+        if self.vae_ds == 1:
+            return mask_pix
+        return F.interpolate(mask_pix, scale_factor=1.0 / self.vae_ds, mode="nearest")
+
     @torch.no_grad()
     def predict_eps(
         self,
@@ -112,56 +128,53 @@ class TargetWrapper(nn.Module):
         t: torch.Tensor,              # [B] integer diffusion timesteps
         cond_latent: torch.Tensor,    # [B,4,Hl,Wl] masked-image latent
         mask_latent: torch.Tensor,    # [B,1,Hl,Wl] (1=hole)
+        cond_emb: torch.Tensor = None,    # text embedding (for CFG-conditional branch)
+        uncond_emb: torch.Tensor = None,  # text embedding (for unconditional branch)
+        guidance_scale: float = 1.0,
     ) -> torch.Tensor:
         """
         Stable Diffusion Inpainting 9-channel input:
             [z_t (4) ; mask (1) ; masked_image_latent (4)]
+
+        If guidance_scale > 1.0 and cond_emb is provided, uses classifier-free guidance:
+            eps_final = uncond + guidance * (cond - uncond)
+        Otherwise unconditional only.
         """
         if not self._available:
-            # dummy: 임의의 일관된 epsilon 반환 (개발 환경용)
             return torch.randn_like(z_t)
 
         B = z_t.shape[0]
-        # mask와 cond_latent를 latent 해상도에 맞춤
+        # mask, cond_latent를 latent 해상도에 맞춤
         if mask_latent.shape[-2:] != z_t.shape[-2:]:
             mask_latent = F.interpolate(mask_latent, size=z_t.shape[-2:], mode="nearest")
         if cond_latent.shape[-2:] != z_t.shape[-2:]:
-            cond_latent = F.interpolate(cond_latent, size=z_t.shape[-2:], mode="bilinear", align_corners=False)
+            cond_latent = F.interpolate(cond_latent, size=z_t.shape[-2:],
+                                        mode="bilinear", align_corners=False)
 
         unet_in = torch.cat([z_t, mask_latent, cond_latent], dim=1).to(self.dtype)
-        emb = self._get_uncond_embedding(B)
-        eps = self.unet(unet_in, t, encoder_hidden_states=emb).sample
+
+        if guidance_scale > 1.0 and cond_emb is not None:
+            # CFG: 두 번 forward
+            unet_in2 = torch.cat([unet_in, unet_in], dim=0)
+            t2 = torch.cat([t, t], dim=0) if t.dim() > 0 else t
+            emb2 = torch.cat([uncond_emb, cond_emb], dim=0)
+            eps_both = self.unet(unet_in2, t2, encoder_hidden_states=emb2).sample
+            eps_uncond, eps_cond = eps_both.chunk(2, dim=0)
+            eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+        else:
+            if uncond_emb is None:
+                uncond_emb = self._get_uncond_embedding(B)
+            eps = self.unet(unet_in, t, encoder_hidden_states=uncond_emb).sample
+
         return eps.to(z_t.dtype)
 
 
 if __name__ == "__main__":
-    import sys
-    device = "cuda" if len(sys.argv) > 1 and sys.argv[1] == "real" else "cpu"
-    if device == "cuda":
-        # 실제 SD-Inpainting 로드 (5GB 다운로드)
-        tw = TargetWrapper(
-            # model_id="stabilityai/stable-diffusion-2-inpainting",
-            # model_id="sd2-community/stable-diffusion-2-inpainting",
-            model_id= "/mnt/HDD_12TB/bam_ki/checkpoints/stable-diffusion-2-inpainting",
-            device=device,
-        )
-    else:
-        # dummy 테스트
-        tw = TargetWrapper(model_id="dummy/none")
-    
-    z = torch.randn(1, 4, 32, 32, device=device)
-    cond = torch.randn(1, 4, 32, 32, device=device)
-    mask = (torch.rand(1, 1, 32, 32, device=device) > 0.7).float()
-    t = torch.tensor([500], device=device)
+    # dummy mode test
+    tw = TargetWrapper(model_id="dummy/none")
+    z = torch.randn(1, 4, 32, 32)
+    cond = torch.randn(1, 4, 32, 32)
+    mask = (torch.rand(1, 1, 32, 32) > 0.7).float()
+    t = torch.tensor([500])
     out = tw.predict_eps(z, t, cond, mask)
-    print(f"eps: {out.shape}, available={tw.available}")
-
-# if __name__ == "__main__":
-#     # dummy mode test
-#     tw = TargetWrapper(model_id="dummy/none")
-#     z = torch.randn(1, 4, 32, 32)
-#     cond = torch.randn(1, 4, 32, 32)
-#     mask = (torch.rand(1, 1, 32, 32) > 0.7).float()
-#     t = torch.tensor([500])
-#     out = tw.predict_eps(z, t, cond, mask)
-#     print(f"dummy eps: {out.shape}")
+    print(f"dummy eps: {out.shape}")
