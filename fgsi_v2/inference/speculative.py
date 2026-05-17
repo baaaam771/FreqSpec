@@ -152,17 +152,25 @@ def fgsr_inpaint(
         a_patch = patch_agreement(eps_d, eps_t, patch_size, beta)
         accept_patch = (a_patch > (1 - tol_patch)).float()
 
+        # NOTE: 마스크 외부 patch에 대해서는 force-accept를 하지 않는다.
+        # 이유: draft가 마스크 외부에서 정확하지 않으면 (학습 데이터의 마스크 분포 영향),
+        # force-accept로 draft eps를 적용하면 마스크 외부가 오염될 수 있음.
+        # 안전을 위해 마스크 외부는 항상 target eps 사용.
         mask_patch = F.max_pool2d(mask_z, patch_size, stride=patch_size)
-        accept_patch = torch.where(mask_patch < 0.5,
-                                   torch.ones_like(accept_patch),
-                                   accept_patch)
 
         accept_full = F.interpolate(accept_patch, size=(H, W), mode="nearest")
-        n_patches = accept_patch.numel()
-        n_acc = accept_patch.sum().item()
-        total_proposed += n_patches
-        total_accepted += n_acc
-        accept_rate = n_acc / max(n_patches, 1)
+        # 마스크 외부 (mask_z < 0.5)는 강제로 target eps만 사용 (accept=0)
+        # 마스크 내부는 agreement score 기반 accept 결정 그대로
+        mask_full = F.interpolate(mask_patch, size=(H, W), mode="nearest")
+        accept_full = accept_full * (mask_full >= 0.5).float()
+
+        # 통계는 마스크 내부 patch에 한해 계산 (외부는 항상 target이라 의미 없음)
+        mask_patch_bool = (mask_patch >= 0.5).float()
+        n_inner = mask_patch_bool.sum().item()
+        n_acc_inner = (accept_patch * mask_patch_bool).sum().item()
+        total_proposed += n_inner
+        total_accepted += n_acc_inner
+        accept_rate = n_acc_inner / max(n_inner, 1)
 
         eps_mix = accept_full * eps_d + (1 - accept_full) * eps_t
         z_next, _ = scheduler.ddim_step(z, eps_mix, t_cur, t_prev)
