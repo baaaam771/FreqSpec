@@ -158,7 +158,15 @@ def fgsr_inpaint(
         # 안전을 위해 마스크 외부는 항상 target eps 사용.
         mask_patch = F.max_pool2d(mask_z, patch_size, stride=patch_size)
 
-        accept_full = F.interpolate(accept_patch, size=(H, W), mode="nearest")
+        # Patch별 decision이 0 또는 1이었던 게, 경계에서 0.5 같은 중간값
+        # 즉 patch 경계에서 draft eps와 target eps가 점진적으로 섞임
+        # Patch grid artifact가 부드러워짐
+        # ver1: mode="nearest" -> hard patch decision
+        # ver2: mode="bilinear" -> soft patch decision (accept rate는 threshold 기준이 아니라 실제 accept_patch 평균으로 계산)
+        # accept_full = F.interpolate(accept_patch, size=(H, W), mode="nearest")
+        accept_full = F.interpolate(accept_patch.float(), size=(H, W), 
+                            mode="bilinear", align_corners=False)
+        
         # 마스크 외부 (mask_z < 0.5)는 강제로 target eps만 사용 (accept=0)
         # 마스크 내부는 agreement score 기반 accept 결정 그대로
         mask_full = F.interpolate(mask_patch, size=(H, W), mode="nearest")
