@@ -62,10 +62,11 @@ class ImageDataset(Dataset):
     재귀 dataset: root 아래의 모든 .jpg/.jpeg/.png/.webp를 평평하게 모은다.
     Places2 같은 다층 폴더 구조에도 그대로 대응.
     Inpainting에는 class label이 필요 없으므로 ImageFolder 대신 직접 구현.
+
+    NOTE: __init__에서 module 객체를 저장하지 않는다 (pickle 불가).
+    Python 3.14+ forkserver 방식에서 multiprocessing dataloader 사용 가능하도록.
     """
     def __init__(self, root, image_size=512):
-        from PIL import Image as _PILImage
-        self._PIL = _PILImage
         self.root = root
         exts = (".jpg", ".jpeg", ".png", ".webp",
                 ".JPG", ".JPEG", ".PNG", ".WEBP")
@@ -88,8 +89,10 @@ class ImageDataset(Dataset):
         return len(self.paths)
 
     def __getitem__(self, i):
+        # PIL을 함수 안에서 import하여 module 객체를 멤버로 저장하지 않음
+        from PIL import Image as PILImage
         try:
-            img = self._PIL.open(self.paths[i]).convert("RGB")
+            img = PILImage.open(self.paths[i]).convert("RGB")
             return self.tf(img)
         except Exception:
             # 깨진 파일 만나면 다음 인덱스 시도
