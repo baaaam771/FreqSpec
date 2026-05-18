@@ -67,16 +67,30 @@ def main(args):
     else:
         sch = DDPMSchedule(device=device)
 
-    # draft
-    draft = DraftEpsUNet(
-        latent_ch=target.latent_ch,
-        num_train_timesteps=sch.num_train_timesteps,
-    ).to(device).eval()
+    # draft - architecture는 checkpoint의 저장된 args에서 자동으로 읽어옴
+    draft_kwargs = {
+        "latent_ch": target.latent_ch,
+        "num_train_timesteps": sch.num_train_timesteps,
+    }
     if args.draft_ckpt and os.path.isfile(args.draft_ckpt):
         ck = torch.load(args.draft_ckpt, map_location=device)
-        draft.load_state_dict(ck["draft"])
-        print(f"[inference] loaded draft {args.draft_ckpt}")
+        # checkpoint에 학습 args가 있으면 그걸 따라 architecture 재구성
+        saved_args = ck.get("args", {})
+        if "draft_base_ch" in saved_args:
+            draft_kwargs["base_ch"] = saved_args["draft_base_ch"]
+            draft_kwargs["ch_mult"] = tuple(saved_args["draft_ch_mult"])
+            draft_kwargs["t_dim"] = saved_args["draft_t_dim"]
+        draft = DraftEpsUNet(**draft_kwargs).to(device).eval()
+        # EMA가 있으면 우선 사용
+        if args.use_ema_draft and "ema_draft" in ck and ck["ema_draft"] is not None:
+            draft.load_state_dict(ck["ema_draft"])
+            print(f"[inference] loaded EMA draft from {args.draft_ckpt}")
+        else:
+            draft.load_state_dict(ck["draft"])
+            print(f"[inference] loaded draft {args.draft_ckpt}")
+        print(f"[inference] draft params: {sum(p.numel() for p in draft.parameters())/1e6:.2f}M")
     else:
+        draft = DraftEpsUNet(**draft_kwargs).to(device).eval()
         print("[inference] no draft ckpt -> random weights")
 
     dwt = DWT2D("haar").to(device)
@@ -183,6 +197,8 @@ def get_parser():
                    help="Text prompt for CFG. Empty = unconditional.")
     p.add_argument("--guidance_scale", type=float, default=7.5,
                    help="CFG guidance scale. 1.0 = no CFG (faster, lower quality).")
+    p.add_argument("--use_ema_draft", action="store_true",
+                   help="Use EMA draft weights if available in checkpoint.")
     p.add_argument("--K", type=int, default=3)
     p.add_argument("--patch", type=int, default=4)
     p.add_argument("--t_spec_start", type=float, default=0.7)

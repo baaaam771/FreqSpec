@@ -154,6 +154,41 @@ def train(args):
     step = 0
     draft.train()
 
+    # ---- EMA (Exponential Moving Average) for stable draft ----
+    if args.use_ema:
+        import copy
+        ema_draft = copy.deepcopy(draft).eval()
+        for p in ema_draft.parameters():
+            p.requires_grad_(False)
+        ema_decay = args.ema_decay
+    else:
+        ema_draft = None
+
+    # ---- Resume from checkpoint ----
+    if args.resume and os.path.isfile(args.resume):
+        ck = torch.load(args.resume, map_location=device)
+        draft.load_state_dict(ck["draft"])
+        if ema_draft is not None and "ema_draft" in ck:
+            ema_draft.load_state_dict(ck["ema_draft"])
+        if "optim" in ck:
+            optim.load_state_dict(ck["optim"])
+        if "step" in ck:
+            step = ck["step"]
+        print(f"[train] resumed from {args.resume} at step {step}")
+
+    # ---- CFG embeddings (pre-compute once for training) ----
+    if args.train_with_cfg and target.available:
+        with torch.no_grad():
+            # Use empty prompt for both (most common inpainting setup)
+            train_uncond_emb = target._encode_prompt([""] * args.batch_size)
+            train_cond_emb = target._encode_prompt([""] * args.batch_size)
+        print(f"[train] CFG training ON (guidance={args.train_guidance_scale})")
+    else:
+        train_uncond_emb = None
+        train_cond_emb = None
+        if args.train_with_cfg:
+            print(f"[train] CFG requested but target not available; ignoring")
+
     for epoch in range(args.epochs):
         if use_dummy:
             iterator = (torch.randn(args.batch_size, 3, args.image_size, args.image_size)
@@ -185,7 +220,15 @@ def train(args):
                 z_t = sch.q_sample(z0, eps_gt, t)
 
                 # 5) target eps (frozen forward, no grad)
-                eps_target = target.predict_eps(z_t, t, cond_z, mask_z)
+                # Adjust uncond_emb if batch size differs
+                cur_uncond = train_uncond_emb[:B] if train_uncond_emb is not None else None
+                cur_cond = train_cond_emb[:B] if train_cond_emb is not None else None
+                eps_target = target.predict_eps(
+                    z_t, t, cond_z, mask_z,
+                    cond_emb=cur_cond,
+                    uncond_emb=cur_uncond,
+                    guidance_scale=args.train_guidance_scale,
+                )
 
             # 6) draft eps (gradients here)
             eps_draft = draft(z_t, t, cond_z, mask_z)
@@ -201,22 +244,63 @@ def train(args):
             torch.nn.utils.clip_grad_norm_(draft.parameters(), 1.0)
             optim.step()
 
+            # EMA update
+            if ema_draft is not None:
+                with torch.no_grad():
+                    for p_ema, p in zip(ema_draft.parameters(), draft.parameters()):
+                        p_ema.mul_(ema_decay).add_(p.data, alpha=1.0 - ema_decay)
+
             if step % args.log_interval == 0:
-                print(f"e{epoch} step{step} | loss={loss.item():.4f} "
+                print(f"step{step} | loss={loss.item():.4f} "
                       f"l_dist={logs['l_distill']:.4f} l_main={logs['l_main']:.4f} "
                       f"l_unif={logs['l_uniform']:.4f} M_t={logs['M_t_active']:.3f}")
+
+            # Step-interval checkpoint
+            if step > 0 and step % args.save_interval == 0:
+                ck = {
+                    "draft": draft.state_dict(),
+                    "optim": optim.state_dict(),
+                    "step": step,
+                    "args": vars(args),
+                }
+                if ema_draft is not None:
+                    ck["ema_draft"] = ema_draft.state_dict()
+                torch.save(ck, os.path.join(args.out_dir, f"draft_step{step:07d}.pt"))
+                # Also save as 'latest' for easy access
+                torch.save(ck, os.path.join(args.out_dir, "draft_latest.pt"))
+                print(f"[train] saved draft_step{step:07d}.pt")
+
             step += 1
             if step >= args.max_steps:
                 break
 
-        torch.save({
+        # End-of-epoch checkpoint (also)
+        ck = {
             "draft": draft.state_dict(),
+            "optim": optim.state_dict(),
+            "step": step,
             "epoch": epoch,
             "args": vars(args),
-        }, os.path.join(args.out_dir, f"draft_e{epoch}.pt"))
+        }
+        if ema_draft is not None:
+            ck["ema_draft"] = ema_draft.state_dict()
+        torch.save(ck, os.path.join(args.out_dir, f"draft_e{epoch}.pt"))
+        torch.save(ck, os.path.join(args.out_dir, "draft_latest.pt"))
         print(f"[train] saved draft_e{epoch}.pt")
         if step >= args.max_steps:
             break
+
+    # Final save
+    ck = {
+        "draft": draft.state_dict(),
+        "optim": optim.state_dict(),
+        "step": step,
+        "args": vars(args),
+    }
+    if ema_draft is not None:
+        ck["ema_draft"] = ema_draft.state_dict()
+    torch.save(ck, os.path.join(args.out_dir, "draft_final.pt"))
+    print(f"[train] saved draft_final.pt at step {step}")
 
 
 def get_parser():
@@ -230,21 +314,35 @@ def get_parser():
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--epochs", type=int, default=999,
+                   help="크게 설정. max_steps로 실제 제어")
     p.add_argument("--steps_per_epoch", type=int, default=200)
-    p.add_argument("--max_steps", type=int, default=50000)
-    p.add_argument("--log_interval", type=int, default=20)
-    # Draft architecture
-    p.add_argument("--draft_base_ch", type=int, default=64)
-    p.add_argument("--draft_ch_mult", type=int, nargs="+", default=[1, 2, 2])
-    p.add_argument("--draft_t_dim", type=int, default=256)
+    p.add_argument("--max_steps", type=int, default=200000)
+    p.add_argument("--log_interval", type=int, default=100)
+    p.add_argument("--save_interval", type=int, default=5000,
+                   help="step 단위 checkpoint 저장 주기")
+    p.add_argument("--resume", type=str, default="",
+                   help="이어서 학습할 checkpoint 경로")
+    # Draft architecture (default = medium, ~50M)
+    p.add_argument("--draft_base_ch", type=int, default=128)
+    p.add_argument("--draft_ch_mult", type=int, nargs="+", default=[1, 2, 4, 4])
+    p.add_argument("--draft_t_dim", type=int, default=512)
     # Loss hyperparams
     p.add_argument("--boundary_weight", type=float, default=1.0)
     p.add_argument("--boundary_kernel", type=int, default=5)
     p.add_argument("--ell", type=float, default=0.3)
-    p.add_argument("--alpha_distill", type=float, default=1.0)
-    p.add_argument("--gamma_main", type=float, default=1.0)
-    p.add_argument("--lambda_uniform", type=float, default=0.1)
+    p.add_argument("--alpha_distill", type=float, default=0.5)
+    p.add_argument("--gamma_main", type=float, default=2.0)
+    p.add_argument("--lambda_uniform", type=float, default=1.0)
+    # CFG training
+    p.add_argument("--train_with_cfg", action="store_true",
+                   help="학습 시 target에 CFG 적용. 학습 비용 2배.")
+    p.add_argument("--train_guidance_scale", type=float, default=1.0,
+                   help="학습 시 guidance scale. train_with_cfg 없으면 1.0 권장.")
+    # EMA
+    p.add_argument("--use_ema", action="store_true",
+                   help="EMA draft 유지 (안정적 결과)")
+    p.add_argument("--ema_decay", type=float, default=0.999)
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
     return p

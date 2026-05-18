@@ -47,8 +47,10 @@ class DraftEpsUNet(nn.Module):
     
     Input channels: 9 = 4 (z_t) + 1 (mask) + 4 (cond_latent)
     Output: 4 channels (epsilon prediction)
+    
+    Default size: ~50M params (medium draft). Adjustable via constructor.
     """
-    def __init__(self, latent_ch=4, base_ch=64, ch_mult=(1, 2, 2), t_dim=256,
+    def __init__(self, latent_ch=4, base_ch=128, ch_mult=(1, 2, 4, 4), t_dim=512,
                  num_train_timesteps=1000):
         super().__init__()
         self.num_train_timesteps = num_train_timesteps
