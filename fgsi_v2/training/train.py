@@ -104,8 +104,13 @@ def train(args):
     print(f"[train] device={device}")
 
     # ---- target (frozen) ----
-    target = TargetWrapper(model_id=args.target_id, device=device)
-    print(f"[train] target available: {target.available}")
+    target_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
+                    "fp32": torch.float32}.get(args.target_dtype, torch.float32)
+    target = TargetWrapper(model_id=args.target_id, device=device,
+                           dtype=target_dtype)
+    print(f"[train] target available: {target.available} "
+          f"(is_sdxl={target.is_sdxl if hasattr(target, 'is_sdxl') else False}, "
+          f"dtype={args.target_dtype})")
 
     # ---- scheduler (target과 호환) ----
     if target.available:
@@ -180,9 +185,10 @@ def train(args):
         print(f"[train] resumed from {args.resume} at step {step}")
 
     # ---- CFG embeddings (pre-compute once for training) ----
+    # Note: target._encode_prompt returns Tensor for SD2, tuple (hidden, pooled) for SDXL.
+    # We keep the raw return so predict_eps can handle both formats.
     if args.train_with_cfg and target.available:
         with torch.no_grad():
-            # Use empty prompt for both (most common inpainting setup)
             train_uncond_emb = target._encode_prompt([""] * args.batch_size)
             train_cond_emb = target._encode_prompt([""] * args.batch_size)
         print(f"[train] CFG training ON (guidance={args.train_guidance_scale})")
@@ -191,6 +197,14 @@ def train(args):
         train_cond_emb = None
         if args.train_with_cfg:
             print(f"[train] CFG requested but target not available; ignoring")
+
+    def _slice_emb(emb, B):
+        """Slice embedding to batch size B. Works for Tensor (SD2) and tuple (SDXL)."""
+        if emb is None:
+            return None
+        if isinstance(emb, tuple):
+            return tuple(e[:B] for e in emb)
+        return emb[:B]
 
     for epoch in range(args.epochs):
         if use_dummy:
@@ -223,9 +237,9 @@ def train(args):
                 z_t = sch.q_sample(z0, eps_gt, t)
 
                 # 5) target eps (frozen forward, no grad)
-                # Adjust uncond_emb if batch size differs
-                cur_uncond = train_uncond_emb[:B] if train_uncond_emb is not None else None
-                cur_cond = train_cond_emb[:B] if train_cond_emb is not None else None
+                # Adjust embeddings if batch size differs (tuple-safe for SDXL)
+                cur_uncond = _slice_emb(train_uncond_emb, B)
+                cur_cond = _slice_emb(train_cond_emb, B)
                 eps_target = target.predict_eps(
                     z_t, t, cond_z, mask_z,
                     cond_emb=cur_cond,
