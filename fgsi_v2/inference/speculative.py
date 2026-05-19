@@ -164,8 +164,9 @@ def fgsr_inpaint(
         # ver1: mode="nearest" -> hard patch decision
         # ver2: mode="bilinear" -> soft patch decision (accept rate는 threshold 기준이 아니라 실제 accept_patch 평균으로 계산)
         # accept_full = F.interpolate(accept_patch, size=(H, W), mode="nearest")
-        accept_full = F.interpolate(accept_patch.float(), size=(H, W), 
-                            mode="bilinear", align_corners=False)
+        # accept_full = F.interpolate(accept_patch.float(), size=(H, W), 
+        #                     mode="bilinear", align_corners=False)
+        accept_full = F.interpolate(accept_patch, size=(H, W), mode="nearest")
         
         # 마스크 외부 (mask_z < 0.5)는 강제로 target eps만 사용 (accept=0)
         # 마스크 내부는 agreement score 기반 accept 결정 그대로
