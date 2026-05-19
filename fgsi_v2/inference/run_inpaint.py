@@ -51,7 +51,10 @@ def save_gray(t, path):
 
 def main(args):
     device = torch.device(args.device)
-    target = TargetWrapper(model_id=args.target_id, device=device)
+    target_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
+                    "fp32": torch.float32}.get(args.target_dtype, torch.float32)
+    target = TargetWrapper(model_id=args.target_id, device=device,
+                           dtype=target_dtype)
     if not target.available:
         print("[inference] WARNING: target dummy mode, results not meaningful")
 
@@ -125,12 +128,19 @@ def main(args):
     # (마스크 외부 보존은 매 step의 blending으로 처리)
     z_init = torch.randn_like(z0)
 
+    # Auto prompt: image 경로에서 카테고리 추출
+    effective_prompt = args.prompt
+    if args.auto_prompt and not effective_prompt:
+        from training.train import _path_to_prompt
+        effective_prompt = _path_to_prompt(args.image)
+        print(f"[inference] auto prompt: '{effective_prompt}'")
+
     # Text embeddings (for CFG)
     if target.available:
         cond_emb, uncond_emb, use_cfg = target.get_text_embeddings(
-            args.prompt, batch_size=z0.shape[0], guidance_scale=args.guidance_scale
+            effective_prompt, batch_size=z0.shape[0], guidance_scale=args.guidance_scale
         )
-        print(f"[inference] CFG={'on' if use_cfg else 'off'} guidance={args.guidance_scale} prompt='{args.prompt}'")
+        print(f"[inference] CFG={'on' if use_cfg else 'off'} guidance={args.guidance_scale} prompt='{effective_prompt}'")
     else:
         cond_emb, uncond_emb = None, None
 
@@ -194,7 +204,14 @@ def get_parser():
     p.add_argument("--image_size", type=int, default=512)
     p.add_argument("--num_steps", type=int, default=50)
     p.add_argument("--prompt", type=str, default="",
-                   help="Text prompt for CFG. Empty = unconditional.")
+                   help="Text prompt for CFG. Empty = unconditional, "
+                        "or use --auto_prompt to infer from image path.")
+    p.add_argument("--auto_prompt", action="store_true",
+                   help="Image 경로에서 카테고리 자동 추출하여 prompt 사용 "
+                        "(Places2 구조 가정). --prompt 비어있을 때만.")
+    p.add_argument("--target_dtype", type=str, default="fp32",
+                   choices=["fp16", "bf16", "fp32"],
+                   help="Target dtype. SDXL은 'fp16' 추천.")
     p.add_argument("--guidance_scale", type=float, default=7.5,
                    help="CFG guidance scale. 1.0 = no CFG (faster, lower quality).")
     p.add_argument("--use_ema_draft", action="store_true",
