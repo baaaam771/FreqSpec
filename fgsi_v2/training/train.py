@@ -449,7 +449,7 @@ def get_parser():
                         "SDXL+CFG 학습은 7.5 표준.")
     p.add_argument("--cfg_drop_prob", type=float, default=0.1,
                    help="CFG drop probability. 각 sample을 이 확률로 빈 prompt로 대체. "
-                        "Classifier-free guidance training 표준 trick (보통 0.1%).")
+                        "Classifier-free guidance training 표준 trick (보통 0.1).")
     # EMA
     p.add_argument("--use_ema", action="store_true",
                    help="EMA draft 유지 (안정적 결과)")
