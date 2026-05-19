@@ -58,7 +58,7 @@ class DWT2D(nn.Module):
 
     def forward(self, x: torch.Tensor):
         B, C, H, W = x.shape
-        f = self.filters.repeat(C, 1, 1, 1)
+        f = self.filters.repeat(C, 1, 1, 1).to(dtype=x.dtype)
         pad = self.k // 2
         x_p = F.pad(x, (pad, pad, pad, pad), mode="reflect")
         y = F.conv2d(x_p, f, stride=2, groups=C)
