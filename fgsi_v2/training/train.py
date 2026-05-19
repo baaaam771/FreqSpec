@@ -326,8 +326,11 @@ def get_parser():
     p.add_argument("--out_dir", type=str, default="./runs")
     p.add_argument("--target_id", type=str,
                    default="stabilityai/stable-diffusion-2-inpainting")
+    p.add_argument("--target_dtype", type=str, default="fp32",
+                   choices=["fp16", "bf16", "fp32"],
+                   help="Target 모델 dtype. SDXL은 'fp16' 추천 (메모리 절약).")
     p.add_argument("--image_size", type=int, default=512,
-                   help="SD-Inpainting은 512 권장")
+                   help="SD-Inpainting은 512 권장. SDXL은 1024 권장.")
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-4)

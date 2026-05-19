@@ -162,8 +162,9 @@ def fgsr_inpaint(
         # 즉 patch 경계에서 draft eps와 target eps가 점진적으로 섞임
         # Patch grid artifact가 부드러워짐
         # ver1: mode="nearest" -> hard patch decision
-        # ver2: mode="bilinear" -> soft patch decision (accept rate는 threshold 기준이 아니라 실제 accept_patch 평균으로 계산)
         # accept_full = F.interpolate(accept_patch, size=(H, W), mode="nearest")
+        
+        # ver2: mode="bilinear" -> soft patch decision (accept rate는 threshold 기준이 아니라 실제 accept_patch 평균으로 계산)
         # accept_full = F.interpolate(accept_patch.float(), size=(H, W), 
         #                     mode="bilinear", align_corners=False)
         accept_full = F.interpolate(accept_patch, size=(H, W), mode="nearest")
