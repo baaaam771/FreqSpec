@@ -115,9 +115,16 @@ class ImageDataset(Dataset):
     NOTE: __init__에서 module 객체를 저장하지 않는다 (pickle 불가).
     Python 3.14+ forkserver 방식에서 multiprocessing dataloader 사용 가능하도록.
     """
-    def __init__(self, root, image_size=512, return_prompt=True):
+    def __init__(self, root, image_size=512, return_prompt=True,
+                 default_prompt=""):
+        """
+        Args:
+            default_prompt: 비어있으면 path에서 카테고리 추출 (Places2 등),
+                            값이 주어지면 모든 이미지에 이 prompt 사용 (FFHQ 등).
+        """
         self.root = root
         self.return_prompt = return_prompt
+        self.default_prompt = default_prompt
         exts = (".jpg", ".jpeg", ".png", ".webp",
                 ".JPG", ".JPEG", ".PNG", ".WEBP")
         self.paths = []
@@ -130,8 +137,11 @@ class ImageDataset(Dataset):
         print(f"[ImageDataset] found {len(self.paths)} images under {root}")
         if return_prompt:
             # 샘플 prompt 출력 (sanity check)
-            sample_prompts = [_path_to_prompt(p) for p in self.paths[:5]]
-            print(f"[ImageDataset] sample prompts: {sample_prompts}")
+            if default_prompt:
+                print(f"[ImageDataset] using fixed prompt: '{default_prompt}'")
+            else:
+                sample_prompts = [_path_to_prompt(p) for p in self.paths[:5]]
+                print(f"[ImageDataset] sample prompts: {sample_prompts}")
         self.tf = transforms.Compose([
             transforms.Resize(image_size),
             transforms.CenterCrop(image_size),
@@ -150,7 +160,10 @@ class ImageDataset(Dataset):
             img = PILImage.open(path).convert("RGB")
             img_t = self.tf(img)
             if self.return_prompt:
-                return img_t, _path_to_prompt(path)
+                # default_prompt 있으면 우선 사용, 아니면 path 기반 추출
+                prompt = self.default_prompt if self.default_prompt \
+                    else _path_to_prompt(path)
+                return img_t, prompt
             return img_t
         except Exception:
             # 깨진 파일 만나면 다음 인덱스 시도
@@ -206,7 +219,8 @@ def train(args):
 
     # ---- data ----
     if args.data_root and os.path.isdir(args.data_root):
-        ds = ImageDataset(args.data_root, image_size=args.image_size)
+        ds = ImageDataset(args.data_root, image_size=args.image_size,
+                          default_prompt=args.default_prompt)
         loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
                             num_workers=args.num_workers, drop_last=True)
         use_dummy = False
@@ -409,6 +423,8 @@ def train(args):
 def get_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--data_root", type=str, default="")
+    p.add_argument("--default_prompt", type=str, default="",
+                   help="모든 이미지에 사용할 단일 prompt. 비어있으면 path에서 카테고리 추출 (Places2 등). FFHQ는 'a photo of a person' 권장.")
     p.add_argument("--out_dir", type=str, default="./runs")
     p.add_argument("--target_id", type=str,
                    default="stabilityai/stable-diffusion-2-inpainting")
@@ -449,7 +465,7 @@ def get_parser():
                         "SDXL+CFG 학습은 7.5 표준.")
     p.add_argument("--cfg_drop_prob", type=float, default=0.1,
                    help="CFG drop probability. 각 sample을 이 확률로 빈 prompt로 대체. "
-                        "Classifier-free guidance training 표준 trick (보통 0.1).")
+                        "Classifier-free guidance training 표준 trick (보통 10%).")
     # EMA
     p.add_argument("--use_ema", action="store_true",
                    help="EMA draft 유지 (안정적 결과)")
