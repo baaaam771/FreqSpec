@@ -57,17 +57,67 @@ def random_inpaint_mask(B, H, W, device, p_box=0.4):
     return torch.stack(masks, dim=0)
 
 
+def _path_to_prompt(path):
+    """
+    Places2 경로에서 카테고리 prompt 추출.
+    
+    예시 경로:
+        /mnt/HDD_12TB/bam_ki/datasets/places2/train_256/data_256/a/army_base/00000123.jpg
+        /mnt/HDD_12TB/bam_ki/datasets/places2/train_256/data_256/p/parking_garage/indoor/00004274.jpg
+    
+    추출 규칙:
+        - 'data_256' 또는 'data_large' 같은 anchor 다음의 단일 글자 폴더 다음이 카테고리.
+        - 그 다음에 'indoor', 'outdoor' 같은 sub-class가 있을 수 있음 (포함).
+        - '_'는 공백으로 변환.
+        - 카테고리 추출 실패 시 generic "a photo".
+    
+    Returns:
+        "a photo of <category>" string
+    """
+    parts = path.replace('\\', '/').split('/')
+    # data_256 / data_large 같은 anchor 찾기
+    anchor_idx = -1
+    for anchor in ('data_256', 'data_large', 'data'):
+        if anchor in parts:
+            anchor_idx = parts.index(anchor)
+            break
+    if anchor_idx < 0 or anchor_idx + 2 >= len(parts):
+        return "a photo"
+    
+    # 단일 글자 폴더 (a, b, ..., z) 건너뛰기
+    candidate = parts[anchor_idx + 1]
+    if len(candidate) == 1 and candidate.isalpha():
+        cat_idx = anchor_idx + 2
+    else:
+        cat_idx = anchor_idx + 1
+    
+    if cat_idx >= len(parts) - 1:  # 카테고리 + 파일명 최소
+        return "a photo"
+    category = parts[cat_idx].replace('_', ' ')
+    
+    # subclass (indoor/outdoor 등) 추가
+    if cat_idx + 1 < len(parts) - 1:
+        sub = parts[cat_idx + 1]
+        if sub in ('indoor', 'outdoor'):
+            category = f"{category} {sub}"
+    
+    return f"a photo of {category}"
+
+
 class ImageDataset(Dataset):
     """
     재귀 dataset: root 아래의 모든 .jpg/.jpeg/.png/.webp를 평평하게 모은다.
     Places2 같은 다층 폴더 구조에도 그대로 대응.
     Inpainting에는 class label이 필요 없으므로 ImageFolder 대신 직접 구현.
 
+    Returns: (image_tensor, prompt_string)
+    
     NOTE: __init__에서 module 객체를 저장하지 않는다 (pickle 불가).
     Python 3.14+ forkserver 방식에서 multiprocessing dataloader 사용 가능하도록.
     """
-    def __init__(self, root, image_size=512):
+    def __init__(self, root, image_size=512, return_prompt=True):
         self.root = root
+        self.return_prompt = return_prompt
         exts = (".jpg", ".jpeg", ".png", ".webp",
                 ".JPG", ".JPEG", ".PNG", ".WEBP")
         self.paths = []
@@ -78,6 +128,10 @@ class ImageDataset(Dataset):
         if len(self.paths) == 0:
             raise RuntimeError(f"No images found under {root}")
         print(f"[ImageDataset] found {len(self.paths)} images under {root}")
+        if return_prompt:
+            # 샘플 prompt 출력 (sanity check)
+            sample_prompts = [_path_to_prompt(p) for p in self.paths[:5]]
+            print(f"[ImageDataset] sample prompts: {sample_prompts}")
         self.tf = transforms.Compose([
             transforms.Resize(image_size),
             transforms.CenterCrop(image_size),
@@ -92,8 +146,12 @@ class ImageDataset(Dataset):
         # PIL을 함수 안에서 import하여 module 객체를 멤버로 저장하지 않음
         from PIL import Image as PILImage
         try:
-            img = PILImage.open(self.paths[i]).convert("RGB")
-            return self.tf(img)
+            path = self.paths[i]
+            img = PILImage.open(path).convert("RGB")
+            img_t = self.tf(img)
+            if self.return_prompt:
+                return img_t, _path_to_prompt(path)
+            return img_t
         except Exception:
             # 깨진 파일 만나면 다음 인덱스 시도
             return self.__getitem__((i + 1) % len(self.paths))
@@ -184,19 +242,24 @@ def train(args):
             step = ck["step"]
         print(f"[train] resumed from {args.resume} at step {step}")
 
-    # ---- CFG embeddings (pre-compute once for training) ----
-    # Note: target._encode_prompt returns Tensor for SD2, tuple (hidden, pooled) for SDXL.
-    # We keep the raw return so predict_eps can handle both formats.
-    if args.train_with_cfg and target.available:
-        with torch.no_grad():
-            train_uncond_emb = target._encode_prompt([""] * args.batch_size)
-            train_cond_emb = target._encode_prompt([""] * args.batch_size)
-        print(f"[train] CFG training ON (guidance={args.train_guidance_scale})")
+    # ---- CFG embeddings ----
+    # 옵션 C에서는 batch별로 다른 prompt를 받아 dynamic encoding 합니다.
+    # CFG drop: 일정 확률로 prompt를 빈 문자열로 대체 (CFG 학습의 표준 trick).
+    use_dynamic_prompts = args.train_with_cfg and target.available
+    if use_dynamic_prompts:
+        print(f"[train] dynamic prompt CFG training ON "
+              f"(guidance={args.train_guidance_scale}, "
+              f"cfg_drop_prob={args.cfg_drop_prob})")
     else:
-        train_uncond_emb = None
-        train_cond_emb = None
         if args.train_with_cfg:
             print(f"[train] CFG requested but target not available; ignoring")
+
+    # uncond embedding (fixed) - 빈 prompt
+    if target.available:
+        with torch.no_grad():
+            train_uncond_emb_full = target._encode_prompt([""] * args.batch_size)
+    else:
+        train_uncond_emb_full = None
 
     def _slice_emb(emb, B):
         """Slice embedding to batch size B. Works for Tensor (SD2) and tuple (SDXL)."""
@@ -206,15 +269,26 @@ def train(args):
             return tuple(e[:B] for e in emb)
         return emb[:B]
 
+    import random as _rnd
+
     for epoch in range(args.epochs):
         if use_dummy:
+            # Dummy: image tensor만 반환 (prompt 없음)
             iterator = (torch.randn(args.batch_size, 3, args.image_size, args.image_size)
                         for _ in range(args.steps_per_epoch))
         else:
             iterator = iter(loader)
 
         for batch in iterator:
-            img = batch.to(device)
+            # batch can be either (img,) or (img, prompts) depending on dataset
+            if isinstance(batch, (list, tuple)) and len(batch) == 2:
+                img, prompts = batch
+                # prompts는 list[str]
+                prompts = list(prompts)
+            else:
+                img = batch
+                prompts = None
+            img = img.to(device)
             B = img.shape[0]
 
             with torch.no_grad():
@@ -237,15 +311,27 @@ def train(args):
                 z_t = sch.q_sample(z0, eps_gt, t)
 
                 # 5) target eps (frozen forward, no grad)
-                # Adjust embeddings if batch size differs (tuple-safe for SDXL)
-                cur_uncond = _slice_emb(train_uncond_emb, B)
-                cur_cond = _slice_emb(train_cond_emb, B)
-                eps_target = target.predict_eps(
-                    z_t, t, cond_z, mask_z,
-                    cond_emb=cur_cond,
-                    uncond_emb=cur_uncond,
-                    guidance_scale=args.train_guidance_scale,
-                )
+                if use_dynamic_prompts and prompts is not None:
+                    # CFG drop: 일부 prompt를 ""로 (classifier-free guidance training trick)
+                    drop_mask = [_rnd.random() < args.cfg_drop_prob for _ in range(B)]
+                    cur_prompts = ["" if d else p for d, p in zip(drop_mask, prompts)]
+                    cur_cond = target._encode_prompt(cur_prompts)
+                    cur_uncond = _slice_emb(train_uncond_emb_full, B)
+                    eps_target = target.predict_eps(
+                        z_t, t, cond_z, mask_z,
+                        cond_emb=cur_cond,
+                        uncond_emb=cur_uncond,
+                        guidance_scale=args.train_guidance_scale,
+                    )
+                else:
+                    # 옵션 A: unconditional only (no prompt)
+                    cur_uncond = _slice_emb(train_uncond_emb_full, B)
+                    eps_target = target.predict_eps(
+                        z_t, t, cond_z, mask_z,
+                        cond_emb=None,
+                        uncond_emb=cur_uncond,
+                        guidance_scale=1.0,
+                    )
 
             # 6) draft eps (gradients here)
             eps_draft = draft(z_t, t, cond_z, mask_z)
@@ -356,9 +442,14 @@ def get_parser():
     p.add_argument("--lambda_uniform", type=float, default=1.0)
     # CFG training
     p.add_argument("--train_with_cfg", action="store_true",
-                   help="학습 시 target에 CFG 적용. 학습 비용 2배.")
+                   help="학습 시 target에 CFG 적용. 학습 비용 2배. "
+                        "Dataset이 prompt를 반환하면 그것 사용, 아니면 빈 prompt.")
     p.add_argument("--train_guidance_scale", type=float, default=1.0,
-                   help="학습 시 guidance scale. train_with_cfg 없으면 1.0 권장.")
+                   help="학습 시 guidance scale. train_with_cfg 없으면 1.0 권장. "
+                        "SDXL+CFG 학습은 7.5 표준.")
+    p.add_argument("--cfg_drop_prob", type=float, default=0.1,
+                   help="CFG drop probability. 각 sample을 이 확률로 빈 prompt로 대체. "
+                        "Classifier-free guidance training 표준 trick (보통 0.1).")
     # EMA
     p.add_argument("--use_ema", action="store_true",
                    help="EMA draft 유지 (안정적 결과)")
