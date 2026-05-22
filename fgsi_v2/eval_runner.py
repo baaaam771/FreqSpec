@@ -78,6 +78,8 @@ def parse_args():
                    help="Phase 1 stabilization 종료 시점 (normalized t).")
     p.add_argument("--patch", type=int, default=4,
                    help="Saliency patch size.")
+    p.add_argument("--beta", type=float, default=10.0,
+                   help="Acceptance threshold sharpness.")
     p.add_argument("--use_ema_draft", action="store_true", default=True,
                    help="EMA draft 사용 (기본 켜짐)")
     p.add_argument("--no_ema_draft", action="store_true",
@@ -159,6 +161,7 @@ def run_one(args, img_path, out_dir, log_path):
         "--tol_high", str(args.tol_high),
         "--t_spec_start", str(args.t_spec_start),
         "--patch", str(args.patch),
+        "--beta", str(args.beta),
         "--out_dir", out_dir,
     ]
     if args.use_ema_draft and not args.no_ema_draft:
