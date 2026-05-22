@@ -70,6 +70,10 @@ def parse_args():
     p.add_argument("--K", type=int, default=3)
     p.add_argument("--tol_low", type=float, default=0.03)
     p.add_argument("--tol_high", type=float, default=0.3)
+    p.add_argument("--uniform_saliency", action="store_true",
+                   help="Ablation: turn off wavelet saliency.")
+    p.add_argument("--no_boundary", action="store_true",
+                   help="Ablation: turn off boundary indicator.")
     p.add_argument("--use_ema_draft", action="store_true", default=True,
                    help="EMA draft 사용 (기본 켜짐)")
     p.add_argument("--no_ema_draft", action="store_true",
@@ -153,6 +157,10 @@ def run_one(args, img_path, out_dir, log_path):
     ]
     if args.use_ema_draft and not args.no_ema_draft:
         cmd.append("--use_ema_draft")
+    if args.uniform_saliency:
+        cmd.append("--uniform_saliency")
+    if args.no_boundary:
+        cmd.append("--no_boundary")
     if args.fixed_prompt:
         cmd += ["--prompt", args.fixed_prompt]
     elif args.auto_prompt:

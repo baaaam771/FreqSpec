@@ -58,7 +58,7 @@ class DWT2D(nn.Module):
 
     def forward(self, x: torch.Tensor):
         B, C, H, W = x.shape
-        f = self.filters.repeat(C, 1, 1, 1).to(dtype=x.dtype)
+        f = self.filters.repeat(C, 1, 1, 1)
         pad = self.k // 2
         x_p = F.pad(x, (pad, pad, pad, pad), mode="reflect")
         y = F.conv2d(x_p, f, stride=2, groups=C)
@@ -87,16 +87,31 @@ def boundary_indicator(mask, kernel=5):
 
 
 def combined_saliency(latent, mask, dwt, boundary_weight=1.0,
-                     boundary_kernel=5, target_size=None, eps=1e-6):
-    """A_combined for inpainting: A_wavelet + λ_b · Boundary."""
+                     boundary_kernel=5, target_size=None, eps=1e-6,
+                     uniform=False):
+    """A_combined for inpainting: A_wavelet + λ_b · Boundary.
+    
+    Args:
+        uniform: True이면 wavelet saliency 무시하고 모든 위치에 동일값 (1.0).
+                 Boundary도 boundary_weight=0이면 무시됨.
+                 둘 다 끄면 saliency = 1.0 everywhere (사실상 unconditional draft use).
+    """
     H_out, W_out = target_size or latent.shape[-2:]
-    A_w = lwd_wavelet_saliency(latent, dwt, target_size=(H_out, W_out), eps=eps)
+    if uniform:
+        # Uniform: saliency = 1 everywhere. Wavelet 계산 skip.
+        A_w = torch.ones(latent.shape[0], 1, H_out, W_out,
+                         device=latent.device, dtype=latent.dtype)
+    else:
+        A_w = lwd_wavelet_saliency(latent, dwt, target_size=(H_out, W_out), eps=eps)
     if mask.shape[-2:] != (H_out, W_out):
         mask_r = F.interpolate(mask, size=(H_out, W_out), mode="nearest")
     else:
         mask_r = mask
-    B_ind = boundary_indicator(mask_r, kernel=boundary_kernel)
-    comb = A_w + boundary_weight * B_ind
+    if boundary_weight > 0:
+        B_ind = boundary_indicator(mask_r, kernel=boundary_kernel)
+        comb = A_w + boundary_weight * B_ind
+    else:
+        comb = A_w
     B = comb.shape[0]
     flat = comb.view(B, -1)
     mn = flat.min(dim=1, keepdim=True)[0]

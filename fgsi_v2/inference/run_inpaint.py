@@ -164,7 +164,8 @@ def main(args):
         t_spec_start_norm=args.t_spec_start,
         beta=args.beta,
         tol_low=args.tol_low, tol_high=args.tol_high,
-        boundary_weight=args.boundary_weight,
+        boundary_weight=0.0 if args.no_boundary else args.boundary_weight,
+        uniform_saliency=args.uniform_saliency,
         dwt=dwt, verbose=args.verbose,
         guidance_scale=args.guidance_scale,
         cond_emb=cond_emb, uncond_emb=uncond_emb,
@@ -223,6 +224,10 @@ def get_parser():
     p.add_argument("--tol_low", type=float, default=0.05)
     p.add_argument("--tol_high", type=float, default=0.5)
     p.add_argument("--boundary_weight", type=float, default=1.0)
+    p.add_argument("--uniform_saliency", action="store_true",
+                   help="Ablation: turn off wavelet saliency (use uniform tol everywhere).")
+    p.add_argument("--no_boundary", action="store_true",
+                   help="Ablation: turn off boundary indicator (boundary_weight=0).")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")

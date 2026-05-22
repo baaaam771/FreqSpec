@@ -62,6 +62,7 @@ def fgsr_inpaint(
     tol_low: float = 0.05,
     tol_high: float = 0.5,
     boundary_weight: float = 1.0,
+    uniform_saliency: bool = False,
     dwt=None,
     verbose: bool = False,
     # CFG / blending
@@ -134,7 +135,8 @@ def fgsr_inpaint(
         # (a) current saliency from z_t (iterative)
         sal = combined_saliency(z, mask_z, dwt,
                                 boundary_weight=boundary_weight,
-                                target_size=(H, W))
+                                target_size=(H, W),
+                                uniform=uniform_saliency)
         sal_patch = F.avg_pool2d(sal, patch_size, stride=patch_size)
         tol_patch = tol_low + (tol_high - tol_low) * (1 - sal_patch)
 
@@ -158,17 +160,7 @@ def fgsr_inpaint(
         # 안전을 위해 마스크 외부는 항상 target eps 사용.
         mask_patch = F.max_pool2d(mask_z, patch_size, stride=patch_size)
 
-        # Patch별 decision이 0 또는 1이었던 게, 경계에서 0.5 같은 중간값
-        # 즉 patch 경계에서 draft eps와 target eps가 점진적으로 섞임
-        # Patch grid artifact가 부드러워짐
-        # ver1: mode="nearest" -> hard patch decision
-        # accept_full = F.interpolate(accept_patch, size=(H, W), mode="nearest")
-        
-        # ver2: mode="bilinear" -> soft patch decision (accept rate는 threshold 기준이 아니라 실제 accept_patch 평균으로 계산)
-        # accept_full = F.interpolate(accept_patch.float(), size=(H, W), 
-        #                     mode="bilinear", align_corners=False)
         accept_full = F.interpolate(accept_patch, size=(H, W), mode="nearest")
-        
         # 마스크 외부 (mask_z < 0.5)는 강제로 target eps만 사용 (accept=0)
         # 마스크 내부는 agreement score 기반 accept 결정 그대로
         mask_full = F.interpolate(mask_patch, size=(H, W), mode="nearest")
