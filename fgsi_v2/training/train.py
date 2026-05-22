@@ -116,15 +116,18 @@ class ImageDataset(Dataset):
     Python 3.14+ forkserver 방식에서 multiprocessing dataloader 사용 가능하도록.
     """
     def __init__(self, root, image_size=512, return_prompt=True,
-                 default_prompt=""):
+                 default_prompt="", caption_json=""):
         """
         Args:
             default_prompt: 비어있으면 path에서 카테고리 추출 (Places2 등),
                             값이 주어지면 모든 이미지에 이 prompt 사용 (FFHQ 등).
+            caption_json: COCO captions JSON 경로. 주어지면 이미지마다 random caption
+                         사용 (이미지당 보통 5개). default_prompt보다 우선.
         """
         self.root = root
         self.return_prompt = return_prompt
         self.default_prompt = default_prompt
+        self.caption_map = {}  # filename → list of captions
         exts = (".jpg", ".jpeg", ".png", ".webp",
                 ".JPG", ".JPEG", ".PNG", ".WEBP")
         self.paths = []
@@ -135,9 +138,32 @@ class ImageDataset(Dataset):
         if len(self.paths) == 0:
             raise RuntimeError(f"No images found under {root}")
         print(f"[ImageDataset] found {len(self.paths)} images under {root}")
+        # COCO captions JSON 로드
+        if caption_json and os.path.isfile(caption_json):
+            print(f"[ImageDataset] loading captions from {caption_json}")
+            import json
+            with open(caption_json) as f:
+                data = json.load(f)
+            # COCO format: {"images": [{"id":..., "file_name":...}, ...],
+            #               "annotations": [{"image_id":..., "caption":...}, ...]}
+            id_to_fn = {im["id"]: im["file_name"] for im in data["images"]}
+            for ann in data["annotations"]:
+                fn = id_to_fn.get(ann["image_id"])
+                if fn is None:
+                    continue
+                self.caption_map.setdefault(fn, []).append(ann["caption"])
+            n_with_cap = sum(1 for fn in self.caption_map if self.caption_map[fn])
+            print(f"[ImageDataset] {n_with_cap} images have captions "
+                  f"(avg {sum(len(v) for v in self.caption_map.values()) / max(1, n_with_cap):.1f} caps/img)")
+            sample_paths = self.paths[:3]
+            for p in sample_paths:
+                fn = os.path.basename(p)
+                caps = self.caption_map.get(fn, [])
+                print(f"  example caps for {fn}: {caps[:2]}")
         if return_prompt:
-            # 샘플 prompt 출력 (sanity check)
-            if default_prompt:
+            if self.caption_map:
+                print(f"[ImageDataset] using COCO captions (per-image)")
+            elif default_prompt:
                 print(f"[ImageDataset] using fixed prompt: '{default_prompt}'")
             else:
                 sample_prompts = [_path_to_prompt(p) for p in self.paths[:5]]
@@ -153,20 +179,29 @@ class ImageDataset(Dataset):
         return len(self.paths)
 
     def __getitem__(self, i):
-        # PIL을 함수 안에서 import하여 module 객체를 멤버로 저장하지 않음
         from PIL import Image as PILImage
+        import random
         try:
             path = self.paths[i]
             img = PILImage.open(path).convert("RGB")
             img_t = self.tf(img)
             if self.return_prompt:
-                # default_prompt 있으면 우선 사용, 아니면 path 기반 추출
-                prompt = self.default_prompt if self.default_prompt \
-                    else _path_to_prompt(path)
+                # 우선순위: caption_map > default_prompt > path 추출
+                if self.caption_map:
+                    fn = os.path.basename(path)
+                    caps = self.caption_map.get(fn, [])
+                    if caps:
+                        prompt = random.choice(caps).strip()
+                    elif self.default_prompt:
+                        prompt = self.default_prompt
+                    else:
+                        prompt = _path_to_prompt(path)
+                else:
+                    prompt = self.default_prompt if self.default_prompt \
+                        else _path_to_prompt(path)
                 return img_t, prompt
             return img_t
         except Exception:
-            # 깨진 파일 만나면 다음 인덱스 시도
             return self.__getitem__((i + 1) % len(self.paths))
 
 
@@ -220,7 +255,8 @@ def train(args):
     # ---- data ----
     if args.data_root and os.path.isdir(args.data_root):
         ds = ImageDataset(args.data_root, image_size=args.image_size,
-                          default_prompt=args.default_prompt)
+                          default_prompt=args.default_prompt,
+                          caption_json=args.caption_json)
         loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
                             num_workers=args.num_workers, drop_last=True)
         use_dummy = False
@@ -425,6 +461,8 @@ def get_parser():
     p.add_argument("--data_root", type=str, default="")
     p.add_argument("--default_prompt", type=str, default="",
                    help="모든 이미지에 사용할 단일 prompt. 비어있으면 path에서 카테고리 추출 (Places2 등). FFHQ는 'a photo of a person' 권장.")
+    p.add_argument("--caption_json", type=str, default="",
+                   help="COCO captions JSON 경로. 주어지면 이미지마다 random caption 사용. default_prompt보다 우선.")
     p.add_argument("--out_dir", type=str, default="./runs")
     p.add_argument("--target_id", type=str,
                    default="stabilityai/stable-diffusion-2-inpainting")
