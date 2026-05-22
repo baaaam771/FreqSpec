@@ -57,8 +57,11 @@ class DWT2D(nn.Module):
         self.k = filters.shape[-1]
 
     def forward(self, x: torch.Tensor):
+        # dtype auto-cast: filter를 input dtype에 맞춰서 fp16 학습 호환
         B, C, H, W = x.shape
         f = self.filters.repeat(C, 1, 1, 1)
+        if f.dtype != x.dtype:
+            f = f.to(x.dtype)
         pad = self.k // 2
         x_p = F.pad(x, (pad, pad, pad, pad), mode="reflect")
         y = F.conv2d(x_p, f, stride=2, groups=C)
