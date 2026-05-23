@@ -88,6 +88,8 @@ def parse_args():
                    help="path에서 카테고리 자동 추출 (Places2)")
     p.add_argument("--fixed_prompt", type=str, default="",
                    help="auto_prompt 대신 모든 이미지에 같은 prompt 사용")
+    p.add_argument("--caption_json", type=str, default="",
+                   help="COCO captions JSON. 주어지면 각 이미지에 그 이미지의 첫 번째 caption 사용 (train과 일관성). fixed_prompt/auto_prompt보다 우선.")
 
     # run_inpaint.py 위치 (module 경로)
     p.add_argument("--run_inpaint_module", type=str, default="inference.run_inpaint",
@@ -144,9 +146,10 @@ def parse_inference_output(text):
     return out
 
 
-def run_one(args, img_path, out_dir, log_path):
+def run_one(args, img_path, out_dir, log_path, prompt_override=None):
     """한 이미지에 대해 run_inpaint.py 실행. 결과는 log_path에 저장.
-    Returns (success, metrics_dict)."""
+    Returns (success, metrics_dict).
+    prompt_override: caption JSON에서 가져온 이미지별 prompt."""
     cmd = [
         sys.executable, "-m", args.run_inpaint_module,
         "--target_id", args.target_id,
@@ -170,7 +173,10 @@ def run_one(args, img_path, out_dir, log_path):
         cmd.append("--uniform_saliency")
     if args.no_boundary:
         cmd.append("--no_boundary")
-    if args.fixed_prompt:
+    # prompt 우선순위: prompt_override (caption JSON) > fixed_prompt > auto_prompt
+    if prompt_override:
+        cmd += ["--prompt", prompt_override]
+    elif args.fixed_prompt:
         cmd += ["--prompt", args.fixed_prompt]
     elif args.auto_prompt:
         cmd.append("--auto_prompt")
@@ -203,6 +209,31 @@ def main():
     img_paths = collect_image_paths(
         args.data_root, args.image_ext, args.num_images, args.seed)
     print(f"[eval_runner] selected {len(img_paths)} images")
+
+    # COCO caption JSON 로드 (옵션)
+    caption_map = {}
+    if args.caption_json and os.path.isfile(args.caption_json):
+        print(f"[eval_runner] loading captions from {args.caption_json}")
+        import json
+        with open(args.caption_json) as f:
+            cap_data = json.load(f)
+        id_to_fn = {im["id"]: im["file_name"] for im in cap_data["images"]}
+        for ann in cap_data["annotations"]:
+            fn = id_to_fn.get(ann["image_id"])
+            if fn is None:
+                continue
+            caption_map.setdefault(fn, []).append(ann["caption"].strip())
+        n_with_cap = len(caption_map)
+        print(f"[eval_runner] {n_with_cap} images have captions")
+        # Sanity check: 평가 이미지들이 caption 가지고 있는지
+        sample_paths = img_paths[:3]
+        for p in sample_paths:
+            fn = os.path.basename(p)
+            caps = caption_map.get(fn, [])
+            if caps:
+                print(f"  caption for {fn}: '{caps[0][:80]}...'" if len(caps[0]) > 80 else f"  caption for {fn}: '{caps[0]}'")
+            else:
+                print(f"  ⚠ NO caption for {fn}")
 
     # CSV header
     csv_path = os.path.join(args.out_root, "results.csv")
@@ -249,11 +280,20 @@ def main():
         summary_log.write(line + "\n")
         summary_log.flush()
 
+        # 이 이미지의 caption 추출 (caption_map 있으면)
+        prompt_override = None
+        if caption_map:
+            fn = os.path.basename(img_path)
+            caps = caption_map.get(fn, [])
+            if caps:
+                prompt_override = caps[0]  # 첫 번째 caption 사용
+
         success = False
         metrics = {}
         for retry in range(args.max_retries):
             t0 = time.time()
-            success, metrics = run_one(args, img_path, out_dir, log_path)
+            success, metrics = run_one(args, img_path, out_dir, log_path,
+                                       prompt_override=prompt_override)
             dt = time.time() - t0
             if success:
                 break
