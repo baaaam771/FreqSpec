@@ -448,7 +448,9 @@ def plot_ablation_panel():
     accs = []
     for setup_str in ["captions", "fixed"]:
         for r in ALL_RESULTS:
-            if r[10] == "main" and r[1] == "COCO" and setup_str in r[2]:
+            # default만 (mid/strict 제외)
+            if (r[10] == "main" and r[1] == "COCO"
+                    and "default" in r[2] and setup_str in r[2]):
                 sps_cap_fix.append(r[4])
                 lps_cap_fix.append(r[7])
                 accs.append(r[8])
