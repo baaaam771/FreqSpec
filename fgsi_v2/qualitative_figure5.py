@@ -72,28 +72,28 @@ def add_metric_box(ax, text, position="bottom"):
 # Build figure
 # ====================================================================
 def main():
-    # ACTUAL paths discovered from filesystem:
+    # ACTUAL good examples discovered through inspection.
     # results/<eval_name>/img_NNN/
     # Files: input.png, mask.png, masked.png, out_baseline.png, out_fgsr.png, saliency.png
     paths = {
-        # ROW 1: Caption vs Fixed (same image, different prompt strategy)
-        # img_003 was the giraffe case where fixed-prompt added a girl
-        "r1_input":         f"{RESULT_ROOT}/sdxl_coco_eval_captions/img_003/masked.png",
-        "r1_baseline":      f"{RESULT_ROOT}/sdxl_coco_eval_captions/img_003/out_baseline.png",
-        "r1_cap_freqspec":  f"{RESULT_ROOT}/sdxl_coco_eval_captions/img_003/out_fgsr.png",
-        "r1_fix_freqspec":  f"{RESULT_ROOT}/sdxl_coco_eval_fixed/img_003/out_fgsr.png",
+        # ROW 1: Caption vs Fixed — img_010 has clear semantic difference
+        "r1_input":         f"{RESULT_ROOT}/sdxl_coco_eval_captions/img_010/masked.png",
+        "r1_baseline":      f"{RESULT_ROOT}/sdxl_coco_eval_captions/img_010/out_baseline.png",
+        "r1_cap_freqspec":  f"{RESULT_ROOT}/sdxl_coco_eval_captions/img_010/out_fgsr.png",
+        "r1_fix_freqspec":  f"{RESULT_ROOT}/sdxl_coco_eval_fixed/img_010/out_fgsr.png",
 
-        # ROW 2: Cross-domain failure (COCO draft on FFHQ vs FFHQ-native draft)
-        "r2_input":     f"{RESULT_ROOT}/cross_cocodraft_on_ffhq_n20/img_001/masked.png",
-        "r2_baseline":  f"{RESULT_ROOT}/cross_cocodraft_on_ffhq_n20/img_001/out_baseline.png",
-        "r2_native":    f"{RESULT_ROOT}/sdxl_ffhq_eval/img_001/out_fgsr.png",  # FFHQ-native
-        "r2_cross":     f"{RESULT_ROOT}/cross_cocodraft_on_ffhq_n20/img_001/out_fgsr.png",  # COCO-cross
+        # ROW 2: Face requires strict tolerance (NEW NARRATIVE)
+        # FFHQ default fails; FFHQ strict preserves the face
+        "r2_input":     f"{RESULT_ROOT}/sdxl_ffhq_eval/img_001/masked.png",
+        "r2_baseline":  f"{RESULT_ROOT}/sdxl_ffhq_eval/img_001/out_baseline.png",
+        "r2_default":   f"{RESULT_ROOT}/sdxl_ffhq_eval/img_001/out_fgsr.png",       # default = artifacts
+        "r2_strict":    f"{RESULT_ROOT}/sdxl_ffhq_strict/img_001/out_fgsr.png",     # strict = preserved
 
-        # ROW 3: Tolerance trade-off (default vs strict on Places2)
-        "r3_input":     f"{RESULT_ROOT}/sdxl_places2_seed200/img_001/masked.png",
-        "r3_baseline":  f"{RESULT_ROOT}/sdxl_places2_seed200/img_001/out_baseline.png",
-        "r3_default":   f"{RESULT_ROOT}/sdxl_places2_seed200/img_001/out_fgsr.png",
-        "r3_strict":    f"{RESULT_ROOT}/sdxl_places2_strict/img_001/out_fgsr.png",
+        # ROW 3: Tolerance trade-off (COCO with captions, img_004)
+        "r3_input":     f"{RESULT_ROOT}/sdxl_coco_eval_captions/img_004/masked.png",
+        "r3_baseline":  f"{RESULT_ROOT}/sdxl_coco_eval_captions/img_004/out_baseline.png",
+        "r3_default":   f"{RESULT_ROOT}/sdxl_coco_eval_captions/img_004/out_fgsr.png",
+        "r3_strict":    f"{RESULT_ROOT}/sdxl_coco_strict/img_004/out_fgsr.png",
     }
 
     fig = plt.figure(figsize=(16, 14))
@@ -110,51 +110,51 @@ def main():
 
     ax = fig.add_subplot(gs[0, 1])
     show_img(ax, paths["r1_baseline"], title="Baseline (target only)")
-    add_metric_box(ax, "PSNR 24.0\nLPIPS 0.07")
+    add_metric_box(ax, "Reference")
 
     ax = fig.add_subplot(gs[0, 2])
     show_img(ax, paths["r1_cap_freqspec"],
-             title="FreqSpec (captions)",
+             title="FreqSpec (per-image caption)",
              title_color="darkgreen")
-    add_metric_box(ax, "PSNR 23.4\nLPIPS 0.08\n1.47×")
+    add_metric_box(ax, "PSNR 20.0\nLPIPS 0.05\n1.19×")
 
     ax = fig.add_subplot(gs[0, 3])
     show_img(ax, paths["r1_fix_freqspec"],
              title="FreqSpec (fixed prompt)",
              title_color="darkred")
-    add_metric_box(ax, "PSNR 22.1\nLPIPS 0.10\n1.56×")
+    add_metric_box(ax, "PSNR 19.9\nLPIPS 0.08\n1.32×")
 
     # ============================================================
-    # ROW 2: Cross-domain Failure (Face)
+    # ROW 2: Face requires strict tolerance (FFHQ)
     # ============================================================
     ax = fig.add_subplot(gs[1, 0])
     show_img(ax, paths["r2_input"],
              title="Input (masked face)",
-             ylabel="(b) Cross-Domain Failure\n(FFHQ Eval)")
+             ylabel="(b) Face Inpainting Difficulty\n(FFHQ, native draft)")
 
     ax = fig.add_subplot(gs[1, 1])
     show_img(ax, paths["r2_baseline"], title="Baseline (target only)")
-    add_metric_box(ax, "PSNR 22.4\nLPIPS 0.05")
+    add_metric_box(ax, "Reference")
 
     ax = fig.add_subplot(gs[1, 2])
-    show_img(ax, paths["r2_native"],
-             title="FreqSpec (FFHQ-native draft)",
-             title_color="darkgreen")
-    add_metric_box(ax, "PSNR 22.4\nLPIPS 0.09\n1.62×")
+    show_img(ax, paths["r2_default"],
+             title="FreqSpec (default τ)",
+             title_color="darkred")
+    add_metric_box(ax, "PSNR 22.4\nLPIPS 0.085\n1.62×")
 
     ax = fig.add_subplot(gs[1, 3])
-    show_img(ax, paths["r2_cross"],
-             title="FreqSpec (COCO-cross draft)",
-             title_color="darkred")
-    add_metric_box(ax, "PSNR 20.8\nLPIPS 0.13\n1.62×")
+    show_img(ax, paths["r2_strict"],
+             title="FreqSpec (strict τ)",
+             title_color="darkgreen")
+    add_metric_box(ax, "PSNR 27.6\nLPIPS 0.025\n1.12×")
 
     # ============================================================
-    # ROW 3: Tolerance Pareto
+    # ROW 3: Tolerance Pareto (COCO with captions)
     # ============================================================
     ax = fig.add_subplot(gs[2, 0])
     show_img(ax, paths["r3_input"],
              title="Input (masked)",
-             ylabel="(c) Tolerance Trade-off\n(Places2)")
+             ylabel="(c) Tolerance Trade-off\n(COCO, with captions)")
 
     ax = fig.add_subplot(gs[2, 1])
     show_img(ax, paths["r3_baseline"], title="Baseline (target only)")
@@ -164,13 +164,13 @@ def main():
     show_img(ax, paths["r3_default"],
              title="FreqSpec (default τ)",
              title_color="darkblue")
-    add_metric_box(ax, "PSNR 22.1\nLPIPS 0.07\n1.35×")
+    add_metric_box(ax, "PSNR 20.3\nLPIPS 0.07\n1.19×")
 
     ax = fig.add_subplot(gs[2, 3])
     show_img(ax, paths["r3_strict"],
              title="FreqSpec (strict τ)",
              title_color="darkblue")
-    add_metric_box(ax, "PSNR 25.9\nLPIPS 0.03\n1.05×")
+    add_metric_box(ax, "PSNR 24.9\nLPIPS 0.04\n1.00×")
 
     # ============================================================
     # Overall title
