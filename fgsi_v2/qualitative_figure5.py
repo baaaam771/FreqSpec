@@ -61,7 +61,7 @@ def add_metric_box(ax, text):
 
 def add_setting_label(ax, text, color="black"):
     """Add a setting label above the column pair (Baseline-FreqSpec)."""
-    ax.text(1.05, 1.15, text, transform=ax.transAxes,
+    ax.text(1.05, 1.08, text, transform=ax.transAxes,
             ha="center", va="bottom",
             fontsize=11, fontweight="bold", color=color,
             bbox=dict(boxstyle="round,pad=0.3",
@@ -93,9 +93,9 @@ def main():
         "r3_freqspec_strict":  f"{RESULT_ROOT}/sdxl_coco_strict/img_004/out_fgsr.png",
     }
 
-    fig = plt.figure(figsize=(22, 14))
-    gs = GridSpec(3, 5, figure=fig, hspace=0.32, wspace=0.04,
-                  left=0.06, right=0.99, top=0.91, bottom=0.04)
+    fig = plt.figure(figsize=(22, 14.5))
+    gs = GridSpec(3, 5, figure=fig, hspace=0.40, wspace=0.04,
+                  left=0.06, right=0.99, top=0.87, bottom=0.04)
 
     # ============================================================
     # ROW 1: Captions vs Fixed prompt
@@ -191,7 +191,7 @@ def main():
 
     fig.suptitle(
         "Figure 5: Qualitative Results — Each FreqSpec output paired with its own baseline",
-        fontsize=14, fontweight="bold", y=0.96
+        fontsize=14, fontweight="bold", y=0.99
     )
 
     out_png = "/mnt/HDD_12TB/bam_ki/results/qualitative_figure5.png"
