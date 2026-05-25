@@ -297,7 +297,7 @@ def panel_b_speculative(ax):
 def panel_c_acceptance(ax):
     """(c) Per-Patch Acceptance Criterion"""
     ax.set_xlim(0, 10)
-    ax.set_ylim(0, 10)
+    ax.set_ylim(0, 11)   # extended top margin for explanation
     ax.set_aspect("equal")
     ax.axis("off")
     ax.set_title("(c) Per-Patch Acceptance",
@@ -306,7 +306,7 @@ def panel_c_acceptance(ax):
     # 6x6 patch grid
     grid_size = 6
     cell_size = 1.0
-    grid_x, grid_y = 1.0, 3.0
+    grid_x, grid_y = 1.0, 2.7   # slightly down to make room above
 
     # Per-patch (saliency, delta) — design example
     np.random.seed(42)
@@ -351,29 +351,31 @@ def panel_c_acceptance(ax):
                     fontsize=11, fontweight="bold", color=txt_color)
 
     # Legend below grid
-    ax.add_patch(Rectangle((1.5, 1.2), 0.6, 0.6,
+    ax.add_patch(Rectangle((1.5, 1.0), 0.6, 0.6,
                             facecolor=C_ACCEPT, edgecolor=C_TEXT,
                             linewidth=1, alpha=0.7))
-    ax.text(2.3, 1.5, "Use draft", ha="left", va="center",
+    ax.text(2.3, 1.3, "Use draft", ha="left", va="center",
             fontsize=9, fontweight="bold")
 
-    ax.add_patch(Rectangle((4.5, 1.2), 0.6, 0.6,
+    ax.add_patch(Rectangle((4.5, 1.0), 0.6, 0.6,
                             facecolor=C_REJECT, edgecolor=C_TEXT,
                             linewidth=1, alpha=0.6))
-    ax.text(5.3, 1.5, "Use target", ha="left", va="center",
+    ax.text(5.3, 1.3, "Use target", ha="left", va="center",
             fontsize=9, fontweight="bold")
 
     # Equation
-    ax.text(5, 0.4,
+    ax.text(5, 0.2,
             r"$\tau(i,j) = \tau_h \cdot A(i,j) + \tau_l \cdot (1 - A(i,j))$",
             ha="center", va="center", fontsize=9,
             bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
                       edgecolor=C_TEXT, linewidth=1))
 
-    # Top: explain saliency-tolerance relation
-    ax.text(5, 9.5,
-            "Low saliency $\\Rightarrow$ loose $\\tau$ $\\Rightarrow$ accept easily\nHigh saliency $\\Rightarrow$ strict $\\tau$ $\\Rightarrow$ reject often",
-            ha="center", va="top", fontsize=8, style="italic")
+    # Top: explain saliency-tolerance relation (boxed for clarity)
+    ax.text(5, 10.3,
+            "Low saliency $\\Rightarrow$ loose $\\tau$ $\\Rightarrow$ accept\nHigh saliency $\\Rightarrow$ strict $\\tau$ $\\Rightarrow$ reject",
+            ha="center", va="center", fontsize=8.5, style="italic",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor=C_BG,
+                      edgecolor=C_TEXT, linewidth=1, alpha=0.9))
 
 
 def main():
