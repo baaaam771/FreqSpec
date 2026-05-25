@@ -72,29 +72,28 @@ def add_metric_box(ax, text, position="bottom"):
 # Build figure
 # ====================================================================
 def main():
-    # IMPORTANT: Update these paths to match the actual filesystem!
-    # These are guesses; verify with: ls /mnt/HDD_12TB/bam_ki/results/
+    # ACTUAL paths discovered from filesystem:
+    # results/<eval_name>/img_NNN/
+    # Files: input.png, mask.png, masked.png, out_baseline.png, out_fgsr.png, saliency.png
     paths = {
-        # ROW 1: Caption vs Fixed (same image, different prompt)
-        # Use COCO image #3 (the giraffe case where Fixed had girl artifact)
-        "r1_input":    f"{RESULT_ROOT}/sdxl_coco_eval_captions/img_003/input.png",
-        "r1_baseline": f"{RESULT_ROOT}/sdxl_coco_eval_captions/img_003/baseline_output.png",
-        "r1_cap_freqspec":  f"{RESULT_ROOT}/sdxl_coco_eval_captions/img_003/fgsr_output.png",
-        "r1_fix_freqspec":  f"{RESULT_ROOT}/sdxl_coco_eval_fixed/img_003/fgsr_output.png",
+        # ROW 1: Caption vs Fixed (same image, different prompt strategy)
+        # img_003 was the giraffe case where fixed-prompt added a girl
+        "r1_input":         f"{RESULT_ROOT}/sdxl_coco_eval_captions/img_003/masked.png",
+        "r1_baseline":      f"{RESULT_ROOT}/sdxl_coco_eval_captions/img_003/out_baseline.png",
+        "r1_cap_freqspec":  f"{RESULT_ROOT}/sdxl_coco_eval_captions/img_003/out_fgsr.png",
+        "r1_fix_freqspec":  f"{RESULT_ROOT}/sdxl_coco_eval_fixed/img_003/out_fgsr.png",
 
-        # ROW 2: Cross-domain failure (COCO draft on FFHQ face)
-        # Use FFHQ image where face structure broke
-        "r2_input":    f"{RESULT_ROOT}/cross_cocodraft_on_ffhq_n20/img_001/input.png",
-        "r2_baseline": f"{RESULT_ROOT}/cross_cocodraft_on_ffhq_n20/img_001/baseline_output.png",
-        "r2_native":   f"{RESULT_ROOT}/sdxl_ffhq_default/img_001/fgsr_output.png",  # FFHQ-native draft
-        "r2_cross":    f"{RESULT_ROOT}/cross_cocodraft_on_ffhq_n20/img_001/fgsr_output.png",  # COCO-cross draft
+        # ROW 2: Cross-domain failure (COCO draft on FFHQ vs FFHQ-native draft)
+        "r2_input":     f"{RESULT_ROOT}/cross_cocodraft_on_ffhq_n20/img_001/masked.png",
+        "r2_baseline":  f"{RESULT_ROOT}/cross_cocodraft_on_ffhq_n20/img_001/out_baseline.png",
+        "r2_native":    f"{RESULT_ROOT}/sdxl_ffhq_eval/img_001/out_fgsr.png",  # FFHQ-native
+        "r2_cross":     f"{RESULT_ROOT}/cross_cocodraft_on_ffhq_n20/img_001/out_fgsr.png",  # COCO-cross
 
-        # ROW 3: Tolerance Pareto (default vs strict)
-        # Use Places2 or FFHQ image
-        "r3_input":    f"{RESULT_ROOT}/sdxl_places2_default/img_001/input.png",
-        "r3_baseline": f"{RESULT_ROOT}/sdxl_places2_default/img_001/baseline_output.png",
-        "r3_default":  f"{RESULT_ROOT}/sdxl_places2_default/img_001/fgsr_output.png",
-        "r3_strict":   f"{RESULT_ROOT}/sdxl_places2_strict/img_001/fgsr_output.png",
+        # ROW 3: Tolerance trade-off (default vs strict on Places2)
+        "r3_input":     f"{RESULT_ROOT}/sdxl_places2_seed200/img_001/masked.png",
+        "r3_baseline":  f"{RESULT_ROOT}/sdxl_places2_seed200/img_001/out_baseline.png",
+        "r3_default":   f"{RESULT_ROOT}/sdxl_places2_seed200/img_001/out_fgsr.png",
+        "r3_strict":    f"{RESULT_ROOT}/sdxl_places2_strict/img_001/out_fgsr.png",
     }
 
     fig = plt.figure(figsize=(16, 14))
