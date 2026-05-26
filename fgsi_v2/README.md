@@ -1,181 +1,325 @@
-# FGSI v2: Frozen-Target Frequency-Guided Speculative Inpainting
+# FreqSpec-Inpaint
 
-기존 v1과의 차이: **Target은 사전학습 SOTA (SD-Inpainting)를 frozen으로 사용**,
-**Draft만 LWD-style frequency-guided supervision으로 학습**.
+**Frequency-Guided Speculative Refinement for Latent Diffusion Inpainting**
 
-이 구조의 장점:
-- 학습 비용 ↓ (target 학습 안 함, draft만 학습)
-- Target 품질이 SOTA로 보장됨
-- **"any latent diffusion inpainting model에 plug-and-play로 efficient inference를 더한다"** 라는
-  깔끔한 contribution statement
+[![Paper](https://img.shields.io/badge/Paper-PDF-red)](docs/paper.pdf)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10+-blue)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c)](https://pytorch.org/)
 
-## Contribution Hierarchy
+Official PyTorch implementation of **FreqSpec-Inpaint**, a frequency-guided speculative refinement framework that delivers **1.28–1.62× wall-clock speedup** on Stable Diffusion 2 / SDXL Inpainting while preserving baseline-level perceptual quality. A single tolerance hyperparameter controls the quality-speed trade-off at inference time *without retraining*.
 
-| Component | Source | Status |
-|---|---|---|
-| Stable Diffusion Inpainting | StabilityAI | Borrowed as target |
-| Scale-consistency VAE | LWD (선택) | Optional VAE swap |
-| Wavelet energy saliency (LWD Eq.3) | LWD | Borrowed |
-| Time-dependent supervision mask (LWD Eq.6) | LWD | Borrowed for draft training |
-| **Mask-boundary-aware saliency** | **Ours** | Inpainting extension |
-| **Frequency-guided draft training** | **Ours** | LWD를 distillation에 적용 |
-| **ε-space speculative refinement** | **Ours** | Main novelty |
-| Patch-wise verify with adaptive tolerance | **Ours** | |
+<!-- TODO: Add teaser figure here -->
+<!-- ![Teaser](docs/teaser.png) -->
 
-## Directory
-```
-fgsi_v2/
-├── models/
-│   ├── wavelet.py         # DWT, LWD saliency, boundary-aware
-│   ├── target_wrapper.py  # SD-Inpainting frozen wrapper
-│   └── draft.py           # DraftEpsUNet (small, ε-prediction)
-├── training/
-│   ├── scheduler.py       # DDPM/DDIM (SD-호환)
-│   ├── losses.py          # DraftLoss (distill + main + uniform)
-│   └── train.py           # draft-only training
-├── inference/
-│   ├── speculative.py     # fgsr_inpaint (ε-space)
-│   └── run_inpaint.py     # baseline vs FGSR
-└── utils/metrics.py
-```
+## ✨ Key Features
 
-## 핵심 동작 원리
+- **Controllable Pareto trade-off**: One tolerance hyperparameter spans LPIPS 0.007–0.115 across 1.02–1.64× speedup.
+- **Plug-and-play with frozen target**: Works with pretrained SD2-Inpainting and SDXL-Inpainting without modifying the target model.
+- **Lightweight draft**: Only **82M parameters** (~30× smaller than SDXL).
+- **Inpainting-specific saliency**: Wavelet-based saliency extended with a mask-boundary indicator for seam-aware acceptance.
+- **Cross-domain validated**: Tested on Places2, FFHQ, and COCO 2017 with a 3×3 transferability matrix.
 
-### Draft Training (target frozen)
+## 📊 Main Results
 
-매 step:
-```
-GT image → VAE → z0
-mask, eps_gt, t 샘플링
-z_t = √α̅_t · z0 + √(1-α̅_t) · eps_gt
+### Pareto Frontier (SDXL Inpainting, 1024×1024)
 
-eps_target = target.predict_eps(z_t, t, cond, mask)   [frozen, no grad]
-eps_draft  = draft (z_t, t, cond, mask)                [trainable]
+| Dataset | Tolerance | Speedup | PSNR | SSIM | LPIPS |
+|---|---|---:|---:|---:|---:|
+| Places2 | default | 1.35× | 22.08 | 0.948 | 0.074 |
+| Places2 | strict | 1.05× | 25.88 | 0.977 | **0.029** |
+| FFHQ | default | 1.62× | 22.44 | 0.934 | 0.085 |
+| FFHQ | strict | 1.12× | 27.58 | 0.972 | **0.025** |
+| COCO (captions) | default | 1.23× | 21.06 | 0.936 | 0.077 |
 
-A_combined = LWD_saliency(z0) + λ_b · BoundaryIndicator(mask)
-M_t = 1[A_combined + ℓ ≥ t/T]
+See [paper](docs/paper.pdf) Table 1 for the full table including SD2 results.
 
-L = α_distill · (1 - M_t) · ||eps_draft - eps_target||²    ← 평탄 영역: target 모방
-  + γ_main    · M_t       · ||eps_draft - eps_gt    ||²    ← 어려운 영역: GT 학습
-  + λ_uniform              · ||eps_draft - eps_gt    ||²    ← 안전망
+## 🔧 Installation
 
-backward & update draft only
-```
+### Requirements
 
-이렇게 학습하면:
-- **평탄 영역**에서 draft는 target과 거의 동일한 ε를 출력 → 추론 시 accept↑
-- **어려운 영역**에서 draft는 GT를 직접 학습 (target에 너무 의존하지 않음)
+- Python 3.10 or higher
+- PyTorch 2.0 or higher with CUDA 11.8+
+- ~16 GB GPU memory for SD2 (512×512), ~36 GB for SDXL (1024×1024)
+- Tested on NVIDIA RTX Pro 6000 (48GB)
 
-### Speculative Refinement (Inference)
+### Setup
 
-DDIM sampling을 진행하면서:
-```
-for t in DDIM_schedule:
-    if t > t_spec_start:
-        # 초기 noisy phase: target만 사용 (saliency 신뢰 어려움)
-        eps = target(z_t, t, cond, mask)
-        z = DDIM_step(z, eps)
-    else:
-        # speculative phase
-        sal = combined_saliency(z_t, mask)  # iterative saliency
-        eps_t = target(z_t, ...)
-        eps_d = draft (z_t, ...)
-        
-        a = exp(-β · ||eps_t - eps_d||²) per patch
-        tol = tol_low + (tol_high - tol_low) * (1 - sal_patch)
-        accept = (a > 1 - tol)
-        
-        eps_mix = accept · eps_d + (1-accept) · eps_t
-        z = DDIM_step(z, eps_mix)
-        
-        if accept_rate > 0.6:
-            # K step 더 draft 단독 진행 (target call 절약)
-            for k in 1..K-1: z = DDIM_step(z, draft(z, ...))
-```
-
-## Setup
 ```bash
-pip install torch torchvision diffusers transformers accelerate Pillow numpy
-# pywavelets 선택 (없어도 Haar/db2 fallback)
-```
-처음 사용 시 SD-Inpainting checkpoint 자동 다운로드 (~5GB).
+# 1. Clone the repository
+git clone https://github.com/<YOUR-USERNAME>/freqspec-inpaint.git
+cd freqspec-inpaint
 
-## Training (draft only)
+# 2. Create a conda environment
+conda create -n FreqSpec python=3.10
+conda activate FreqSpec
+
+# 3. Install PyTorch (adjust CUDA version as needed)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+
+# 4. Install other dependencies
+pip install -r requirements.txt
+```
+
+### Download Pretrained Target Models
+
 ```bash
-python -m training.train \
-    --data_root /path/to/Places2 \
-    --target_id stabilityai/stable-diffusion-2-inpainting \
-    --image_size 512 --batch_size 2 \
-    --alpha_distill 1.0 --gamma_main 1.0 --lambda_uniform 0.1 \
-    --boundary_weight 1.0 --ell 0.3 \
-    --out_dir runs/draft_v1
-```
-- Target은 GPU에 frozen으로 상주 (~3GB VRAM)
-- Draft만 학습 (~500MB VRAM)
-- A100 1장에서 batch_size=4까지 가능
+# SD2 Inpainting (865M, ~5 GB)
+hf download stabilityai/stable-diffusion-2-inpainting \
+    --local-dir checkpoints/stable-diffusion-2-inpainting
 
-## Inference
+# SDXL Inpainting (2.6B, ~12 GB)
+hf download diffusers/stable-diffusion-xl-1.0-inpainting-0.1 \
+    --local-dir checkpoints/stable-diffusion-xl-1.0-inpainting-0.1
+```
+
+> **Note**: `huggingface-cli` is deprecated as of `huggingface_hub` v1.0 (Oct 2025). Use `hf <resource> <action>` format.
+
+### Download Pretrained Draft Models
+
+<!-- TODO: Upload to Hugging Face and update these links -->
+
+| Draft | Target | Dataset | Steps | Link |
+|---|---|---|---|---|
+| Places2 draft | SD2-Inpainting | Places2 | 150K | [TBA](#) |
+| Places2 draft | SDXL-Inpainting | Places2 | 290K | [TBA](#) |
+| FFHQ draft | SDXL-Inpainting | FFHQ | 200K | [TBA](#) |
+| COCO draft | SDXL-Inpainting | COCO 2017 | 200K | [TBA](#) |
+
+```bash
+# Example: download SDXL Places2 draft
+mkdir -p checkpoints/drafts
+# wget <CHECKPOINT_URL> -O checkpoints/drafts/sdxl_places2_draft.pt
+```
+
+## 🚀 Quick Start: Inference
+
+Inpaint a single image with default settings:
+
 ```bash
 python -m inference.run_inpaint \
-    --image sample.jpg --mask sample_mask.png \
-    --draft_ckpt runs/draft_v1/draft_e9.pt \
-    --num_steps 50 --K 3 --patch 4 \
-    --t_spec_start 0.7 --beta 10.0 \
-    --tol_low 0.05 --tol_high 0.5 \
-    --verbose --out_dir results/
+    --target_id checkpoints/stable-diffusion-xl-1.0-inpainting-0.1 \
+    --draft_ckpt checkpoints/drafts/sdxl_places2_draft.pt \
+    --image path/to/image.jpg \
+    --out_dir results/demo \
+    --prompt "a photograph" \
+    --K 3 --tol_low 0.03 --tol_high 0.3 \
+    --use_ema_draft
 ```
 
-## 실험 권장
+### Key Inference Arguments
 
-| Setup | 의미 | 기대 결과 |
+| Argument | Default | Description |
 |---|---|---|
-| SD-Inpainting 50 DDIM | Baseline | FID = X, NFE_target = 50 |
-| SD-Inpainting 25 DDIM | Naive fewer-step | FID = X + Δ, NFE_target = 25 |
-| **FGSI (ours)** | Frequency-guided spec | FID ≈ X, NFE_target ≈ 25-30 |
-| FGSI saliency-blind | Speculative w/o frequency | FID = X + ε, accept rate↓ |
+| `--K` | `3` | Speculation window (1=single-step, 3=balanced, 5=aggressive) |
+| `--tol_low` | `0.03` | Loose tolerance for low-saliency (smooth) regions |
+| `--tol_high` | `0.3` | Strict tolerance for high-saliency (texture, boundary) regions |
+| `--t_spec_start` | `0.7` | Phase 1 (target-only) duration. Larger = more conservative |
+| `--patch` | `4` | Patch size for per-patch acceptance |
+| `--beta` | `10.0` | Acceptance sharpness (lower = looser) |
+| `--guidance_scale` | `7.5` | CFG scale (SDXL); use `1.0` for SD2 |
+| `--num_steps` | `50` | Denoising steps |
 
-**핵심 주장 가능 명제**:
-- "Same FID at fewer target NFE" → quality-preserving speedup
-- "Higher quality at same target NFE" → quality boost at no extra cost
+### Tolerance Presets
 
-## Hyperparameter 튜닝 가이드
+For convenience, use these presets:
 
-| param | 효과 | 시작값 |
-|---|---|---|
-| `alpha_distill` | 평탄 영역에서 target 모방 강도 | 1.0 |
-| `gamma_main` | 어려운 영역에서 GT 학습 강도 | 1.0 |
-| `lambda_uniform` | 전 영역 안전망 | 0.1 |
-| `ell` | LWD lower bound (Eq.6) | 0.3 |
-| `boundary_weight` | 경계 saliency 강조 | 1.0 |
-| `t_spec_start` | spec 시작 timestep (normalized) | 0.7 |
-| `K` | accept 시 draft 추가 step 수 | 3 |
-| `beta` | agreement score 민감도 | 10 |
-| `tol_low / tol_high` | strict / lenient tolerance | 0.05 / 0.5 |
+```bash
+# Strict (≈1.05×, near-baseline quality)
+--tol_low 0.01 --tol_high 0.1
 
-## 알려진 제약
+# Mid (≈1.11×, balanced)
+--tol_low 0.02 --tol_high 0.15
 
-- Target은 latent diffusion 계열로 한정 (LaMa, MAT 같은 픽셀 공간 모델 불가)
-- Draft를 target과 같은 parameterization(ε-prediction)으로 학습해야 함
-- Pretrained target의 성능이 천장 — target이 약하면 ours도 약함
-- 초기 timestep (t > t_spec_start)에서는 speculative 미적용 → 그 구간은 baseline과 동일
+# Default (≈1.35×, recommended)
+--tol_low 0.03 --tol_high 0.3
 
-## Citation
+# Aggressive (≈1.64×, for previews)
+--tol_low 0.03 --tol_high 0.3 --t_spec_start 0.9
+```
 
-LWD를 학습 supervision에 차용:
+### Per-Image Captions (COCO-style)
+
+For COCO-trained drafts, use per-image captions for best quality (20% LPIPS improvement over generic prompts):
+
+```bash
+python -m inference.run_inpaint \
+    --target_id checkpoints/stable-diffusion-xl-1.0-inpainting-0.1 \
+    --draft_ckpt checkpoints/drafts/sdxl_coco_draft.pt \
+    --image path/to/coco_image.jpg \
+    --prompt "A young boy holding a baseball bat at home plate" \
+    --out_dir results/demo
+```
+
+## 🎯 Training Your Own Draft
+
+### Prepare Datasets
+
+```bash
+# Places2 (1.8M images, ~120 GB)
+# Download from: http://places2.csail.mit.edu/
+
+# FFHQ (70K images, ~90 GB at 1024×1024)
+hf download <USERNAME>/ffhq_hf --repo-type dataset \
+    --local-dir datasets/ffhq_hf
+
+# COCO 2017
+# Download from: https://cocodataset.org/#download
+# Required: train2017.zip, val2017.zip, annotations_trainval2017.zip
+```
+
+### Train Draft
+
+```bash
+# Train SDXL Places2 draft (~6 days on RTX Pro 6000)
+python -m train_freqspec \
+    --target_id checkpoints/stable-diffusion-xl-1.0-inpainting-0.1 \
+    --dataset_root datasets/places2 \
+    --image_size 1024 \
+    --batch_size 1 \
+    --grad_accum 4 \
+    --lr 1e-4 \
+    --total_steps 290000 \
+    --use_cfg --guidance_scale 7.5 \
+    --out_dir runs/sdxl_places2 \
+    --save_every 10000
+```
+
+### Train with COCO Captions
+
+```bash
+python -m train_freqspec_coco \
+    --target_id checkpoints/stable-diffusion-xl-1.0-inpainting-0.1 \
+    --dataset_root datasets/coco2017 \
+    --captions_json datasets/coco2017/annotations/captions_train2017.json \
+    --image_size 1024 \
+    --total_steps 200000 \
+    --out_dir runs/sdxl_coco
+```
+
+### Training Loss
+
+```
+L = α_d · L_distill + γ_m · L_main + λ_u · L_uniform
+```
+
+Where:
+- `L_distill`: Saliency-weighted distillation against target's ε prediction
+- `L_main`: Standard noise prediction loss
+- `L_uniform`: Regularization on full image
+- Default weights: `α_d = 1.0`, `γ_m = 1.0`, `λ_u = 0.1`
+
+## 📁 Repository Structure
+
+```
+freqspec-inpaint/
+├── freqspec/              # Core library
+│   ├── saliency.py        # Wavelet + boundary saliency
+│   ├── speculative.py     # ε-space speculative refinement
+│   ├── acceptance.py      # Per-patch acceptance logic
+│   └── draft_unet.py      # 82M draft U-Net architecture
+├── inference/
+│   ├── run_inpaint.py     # Main inference script
+│   └── eval_dataset.py    # Batch evaluation
+├── training/
+│   ├── train_freqspec.py        # Training loop (no captions)
+│   └── train_freqspec_coco.py   # Training with captions
+├── evaluation/
+│   ├── metrics.py         # PSNR, SSIM, LPIPS
+│   └── summarize.py       # Aggregate results, make figures
+├── figures/               # Paper figures (regenerated from results)
+├── docs/
+│   ├── paper.pdf          # Paper
+│   └── teaser.png
+├── requirements.txt
+├── LICENSE
+└── README.md
+```
+
+## 🔬 Reproducing Paper Results
+
+### Main Pareto results (Table 1, Figure 2)
+
+```bash
+bash scripts/eval_main_pareto.sh
+```
+
+This runs default / mid / strict tolerance on each model-dataset combination (~4 hours on RTX Pro 6000).
+
+### Cross-domain transferability (Table 2, Figure 3)
+
+```bash
+bash scripts/eval_cross_domain.sh
+```
+
+### Ablations (Figure 4)
+
+```bash
+bash scripts/eval_ablations.sh
+```
+
+Outputs are aggregated into `results/final_all_results.csv` and plotted by `evaluation/summarize.py`.
+
+## 📈 Practical Deployment Guide
+
+Based on our 32-measurement empirical analysis, we recommend:
+
+| Use Case | Tolerance | Speedup | Notes |
+|---|---|---|---|
+| **Portrait editing** | strict | 1.12× | Use FFHQ-trained draft (LPIPS 0.025) |
+| **General editor** | default | 1.35× | Use COCO-trained draft with per-image captions |
+| **Human-reviewed output** | strict | 1.05× | LPIPS 0.029, near-baseline |
+| **Batch processing** | default | 1.35× | Best speedup/quality balance |
+| **Previews & iteration** | aggressive | 1.64× | Re-run with strict once satisfied |
+
+**Cross-domain tips**:
+- Natural scenes (Places2) is a "universal target" — any sufficiently trained draft works
+- Faces (FFHQ) require *domain-specific* training; cross-domain drafts fail badly (LPIPS 0.153)
+- For unknown-domain deployment, train on COCO (most diverse) with per-image captions
+
+## ⚠️ Limitations
+
+- **Comparison with distillation methods** (LCM, SDXL-Turbo): Not included; FreqSpec is *complementary* to distillation and could be combined.
+- **Newer architectures**: Tested on U-Net based SD2/SDXL. Diffusion Transformer (DiT) models (SD3, FLUX) may need redesign.
+- **Single-target compatibility**: Draft is trained per target; multi-target distillation is future work.
+
+See paper Section 5.4 for full discussion.
+
+## 📜 Citation
+
+If you use this code or find our work useful, please cite:
+
 ```bibtex
-@article{sigillo2025lwd,
-  title={Latent Wavelet Diffusion: Enabling 4K Image Synthesis for Free},
-  author={Sigillo, Luigi and He, Shengfeng and Comminiello, Danilo},
-  journal={arXiv preprint arXiv:2506.00433},
-  year={2025}
+@article{lee2025freqspec,
+  title   = {FreqSpec-Inpaint: Frequency-Guided Speculative Refinement
+             for Latent Diffusion Inpainting},
+  author  = {Lee, BeomGi},
+  journal = {arXiv preprint arXiv:XXXX.XXXXX},
+  year    = {2025}
 }
 ```
-Target으로 SD-Inpainting 사용:
-```bibtex
-@article{rombach2022ldm,
-  title={High-Resolution Image Synthesis with Latent Diffusion Models},
-  author={Rombach, Robin and others},
-  journal={CVPR},
-  year={2022}
-}
-```
+
+## 🙏 Acknowledgments
+
+This work builds on several open-source projects:
+
+- [Diffusers](https://github.com/huggingface/diffusers) — Stable Diffusion infrastructure
+- [Latent Wavelet Diffusion (LWD)](https://arxiv.org/abs/2506.00433) — Wavelet saliency formulation (we extend with boundary-awareness)
+- [Stable Diffusion 2 Inpainting](https://huggingface.co/stabilityai/stable-diffusion-2-inpainting) — Target model
+- [SDXL Inpainting](https://huggingface.co/diffusers/stable-diffusion-xl-1.0-inpainting-0.1) — Target model
+
+## 📧 Contact
+
+For questions, issues, or collaboration:
+
+- **Author**: BeomGi Lee  
+- **Email**: jeongiun@hanyang.ac.kr  
+- **GitHub Issues**: For bug reports and feature requests, please open an [issue](https://github.com/<YOUR-USERNAME>/freqspec-inpaint/issues)
+
+## 📄 License
+
+This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
+
+---
+
+<sub>Last updated: 2025-XX-XX</sub>
