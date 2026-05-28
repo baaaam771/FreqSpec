@@ -1,0 +1,401 @@
+#!/usr/bin/env python
+"""
+baseline_sweep.py — Reduced-step baseline vs FreqSpec comparison runner.
+
+Reviewer-critical experiment: answers "is FreqSpec better than just reducing
+the target's denoising steps to match the speed?"
+
+This script reuses the EXISTING inference pipeline (baseline_inpaint /
+fgsr_inpaint from inference.speculative) — no new inference logic. It:
+  1. Builds a FIXED manifest of (image, mask, prompt, seed) — shared by all
+     methods so comparisons are paired and fair.
+  2. Runs each method (Target at several step counts + FreqSpec at several
+     tolerances) on the SAME manifest.
+  3. Times each run with torch.cuda.synchronize() for accurate wall-clock.
+  4. Saves per-image outputs and an image-level CSV per method.
+
+Metrics (Boundary/Masked LPIPS) are computed separately by
+analyze_speed_matched.py, which reads the saved images.
+
+Example:
+    python baseline_sweep.py \\
+        --target_id /mnt/HDD_12TB/bam_ki/checkpoints/stable-diffusion-xl-1.0-inpainting-0.1 \\
+        --draft_ckpt /mnt/HDD_12TB/bam_ki/runs/sdxl_v1/draft_step0290000.pt \\
+        --data_root /mnt/HDD_12TB/bam_ki/datasets/places2 \\
+        --out_root /mnt/HDD_12TB/bam_ki/results/baseline_sweep_places2 \\
+        --num_images 100 --image_size 1024 --guidance_scale 7.5 \\
+        --auto_prompt
+"""
+import argparse
+import csv
+import json
+import os
+import random
+import sys
+import time
+from pathlib import Path
+
+import torch
+from PIL import Image
+from torchvision import transforms
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from models.target_wrapper import TargetWrapper
+from models.draft import DraftEpsUNet
+from models.wavelet import DWT2D
+from training.scheduler import DDPMSchedule
+from inference.speculative import fgsr_inpaint, baseline_inpaint
+
+
+# ====================================================================
+# Method definitions: the set of methods to compare on the same images
+# ====================================================================
+# Target-only at different step counts (reduced-step baselines).
+# FreqSpec at different tolerances (all at 50 steps).
+# NOTE: step counts for target baselines are chosen to bracket the FreqSpec
+# speedups; analyze_speed_matched.py finds the speed-matched pairs afterward.
+def build_method_list(args):
+    methods = []
+    # Reduced-step target baselines
+    for steps in args.target_steps:
+        methods.append({
+            "name": f"target_s{steps}",
+            "type": "target",
+            "num_steps": steps,
+            "tol_low": None, "tol_high": None,
+        })
+    # FreqSpec tolerance presets (all at full 50-step schedule)
+    fs_presets = [
+        ("freqspec_strict",  0.01, 0.10),
+        ("freqspec_mid",     0.02, 0.15),
+        ("freqspec_default", 0.03, 0.30),
+    ]
+    for name, tl, th in fs_presets:
+        methods.append({
+            "name": name,
+            "type": "freqspec",
+            "num_steps": args.num_steps,
+            "tol_low": tl, "tol_high": th,
+        })
+    return methods
+
+
+# ====================================================================
+# Image / mask helpers (match run_inpaint.py preprocessing)
+# ====================================================================
+def load_image(path, size):
+    img = Image.open(path).convert("RGB")
+    return transforms.Compose([
+        transforms.Resize(size),
+        transforms.CenterCrop(size),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5] * 3, [0.5] * 3),
+    ])(img).unsqueeze(0)
+
+
+def make_mask(size, rng, box_prob=0.5):
+    """
+    Generate a synthetic mask deterministically from rng.
+    Mirrors the train/eval mask style: box or large rectangle.
+    Returns 1x1xHxW float (1 = masked/inpaint region).
+    """
+    H = W = size
+    m = torch.zeros(1, 1, H, W)
+    # central-ish box covering 12-25% area
+    area_frac = rng.uniform(0.12, 0.25)
+    bh = int((area_frac ** 0.5) * H)
+    bw = int((area_frac ** 0.5) * W)
+    top = rng.randint(0, H - bh)
+    left = rng.randint(0, W - bw)
+    m[:, :, top:top + bh, left:left + bw] = 1.0
+    return m
+
+
+def save_rgb(t, path):
+    t = (t.clamp(-1, 1) + 1) / 2
+    Image.fromarray(
+        (t[0].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
+    ).save(path)
+
+
+def save_gray(t, path):
+    Image.fromarray(
+        (t[0, 0].cpu().numpy() * 255).clip(0, 255).astype("uint8")
+    ).save(path)
+
+
+# ====================================================================
+# Manifest: fixed list of images shared by all methods
+# ====================================================================
+def build_manifest(args):
+    """Collect num_images images deterministically (seed-fixed)."""
+    root = Path(args.data_root)
+    exts = ["jpg", "jpeg", "png", "webp"]
+    all_imgs = []
+    for e in exts:
+        all_imgs += list(root.rglob(f"*.{e}"))
+    all_imgs = sorted(str(p) for p in all_imgs)
+    rng = random.Random(args.seed)
+    rng.shuffle(all_imgs)
+    chosen = all_imgs[:args.num_images]
+
+    manifest = []
+    for idx, img_path in enumerate(chosen):
+        # per-image deterministic seed for mask + diffusion noise
+        img_seed = args.seed * 100000 + idx
+        prompt = ""
+        if args.auto_prompt:
+            # use the project's own path->prompt logic for consistency
+            try:
+                from training.train import _path_to_prompt
+                prompt = _path_to_prompt(img_path)
+            except Exception:
+                parts = Path(img_path).parts
+                cat = parts[-2].replace("_", " ") if len(parts) >= 2 else "scene"
+                prompt = f"a photo of a {cat}"
+        manifest.append({
+            "idx": idx,
+            "image_path": img_path,
+            "prompt": prompt,
+            "seed": img_seed,
+        })
+    return manifest
+
+
+# ====================================================================
+# Timing with CUDA sync (reviewer-required for accurate wall-clock)
+# ====================================================================
+def timed_run(fn, device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    out = fn()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    return out, time.perf_counter() - t0
+
+
+# ====================================================================
+# Main
+# ====================================================================
+def main(args):
+    device = torch.device(args.device)
+    target_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16,
+                    "fp32": torch.float32}[args.target_dtype]
+
+    target = TargetWrapper(model_id=args.target_id, device=device,
+                           dtype=target_dtype)
+    assert target.available, "Target model must be available for real eval."
+
+    sch = DDPMSchedule(
+        num_train_timesteps=target.scheduler_ref.config.num_train_timesteps,
+        beta_start=target.scheduler_ref.config.beta_start,
+        beta_end=target.scheduler_ref.config.beta_end,
+        beta_schedule=target.scheduler_ref.config.beta_schedule,
+        device=device,
+    )
+
+    # Load draft (architecture restored from checkpoint args, matching
+    # run_inpaint.py exactly)
+    draft_kwargs = {
+        "latent_ch": target.latent_ch,
+        "num_train_timesteps": sch.num_train_timesteps,
+    }
+    ck = torch.load(args.draft_ckpt, map_location=device)
+    saved_args = ck.get("args", {})
+    if "draft_base_ch" in saved_args:
+        draft_kwargs["base_ch"] = saved_args["draft_base_ch"]
+        draft_kwargs["ch_mult"] = tuple(saved_args["draft_ch_mult"])
+        draft_kwargs["t_dim"] = saved_args["draft_t_dim"]
+    draft = DraftEpsUNet(**draft_kwargs).to(device).eval()
+    if args.use_ema_draft and ck.get("ema_draft") is not None:
+        draft.load_state_dict(ck["ema_draft"])
+        print(f"[sweep] loaded EMA draft")
+    else:
+        draft.load_state_dict(ck["draft"])
+        print(f"[sweep] loaded draft")
+    print(f"[sweep] draft params: "
+          f"{sum(p.numel() for p in draft.parameters())/1e6:.2f}M")
+
+    dwt = DWT2D("haar").to(device)
+
+    methods = build_method_list(args)
+    manifest = build_manifest(args)
+
+    os.makedirs(args.out_root, exist_ok=True)
+    with open(os.path.join(args.out_root, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"[sweep] {len(manifest)} images x {len(methods)} methods")
+    print(f"[sweep] methods: {[m['name'] for m in methods]}")
+
+    # Warmup (excluded from timing) — first image, target-only
+    print("[sweep] warmup...")
+    _warmup(target, draft, sch, dwt, manifest[0], args, device)
+
+    # Run all methods on all images
+    for method in methods:
+        m_out = os.path.join(args.out_root, method["name"])
+        os.makedirs(m_out, exist_ok=True)
+        csv_path = os.path.join(m_out, "results.csv")
+
+        done = set()
+        if args.resume and os.path.isfile(csv_path):
+            with open(csv_path) as f:
+                for row in csv.DictReader(f):
+                    done.add(int(row["idx"]))
+
+        write_header = not (args.resume and os.path.isfile(csv_path))
+        f_csv = open(csv_path, "a", newline="")
+        writer = csv.writer(f_csv)
+        if write_header:
+            writer.writerow([
+                "idx", "image_path", "method", "num_steps",
+                "time_sec", "target_nfe", "draft_nfe", "accept_rate",
+            ])
+
+        print(f"\n[sweep] === {method['name']} ===")
+        for item in manifest:
+            if item["idx"] in done:
+                continue
+            row = run_one(target, draft, sch, dwt, item, method, args, device)
+            writer.writerow(row)
+            f_csv.flush()
+            print(f"  [{method['name']}] img {item['idx']:03d}  "
+                  f"t={row[4]:.2f}s  tgt_nfe={row[5]}")
+        f_csv.close()
+
+    print(f"\n[sweep] done -> {args.out_root}")
+    print("[sweep] next: run analyze_speed_matched.py to compute metrics")
+
+
+def _prepare_latents(target, sch, item, args, device):
+    """Encode image, build mask, make initial noise (seeded).
+    Mirrors run_inpaint.py exactly."""
+    img = load_image(item["image_path"], args.image_size).to(device)
+    rng = random.Random(item["seed"])
+    mask_pix = make_mask(args.image_size, rng).to(device)
+    masked_pix = img * (1 - mask_pix)
+
+    z0 = target.encode_image(img)
+    cond_z = target.encode_image(masked_pix)       # known-region conditioning
+    mask_z = target.downsample_mask(mask_pix)
+
+    # seeded initial noise for reproducibility across methods
+    torch.manual_seed(item["seed"])
+    z_init = torch.randn_like(z0)
+
+    return img, mask_pix, z0, mask_z, cond_z, z_init
+
+
+def _get_emb(target, item, args, z0):
+    """Returns (cond_emb, uncond_emb). get_text_embeddings returns a 3-tuple
+    (cond, uncond, use_cfg) — matching run_inpaint.py."""
+    prompt = item["prompt"] or "a photograph"
+    cond_emb, uncond_emb, use_cfg = target.get_text_embeddings(
+        prompt, batch_size=z0.shape[0], guidance_scale=args.guidance_scale
+    )
+    return cond_emb, uncond_emb
+
+
+def _warmup(target, draft, sch, dwt, item, args, device):
+    img, mask_pix, z0, mask_z, cond_z, z_init = _prepare_latents(
+        target, sch, item, args, device)
+    cond_emb, uncond_emb = _get_emb(target, item, args, z0)
+    with torch.no_grad():
+        baseline_inpaint(
+            target, z_init.clone(), cond_z, mask_z, sch,
+            num_inference_steps=10, guidance_scale=args.guidance_scale,
+            cond_emb=cond_emb, uncond_emb=uncond_emb,
+            known_z=z0, blend_known=True,
+        )
+
+
+def run_one(target, draft, sch, dwt, item, method, args, device):
+    img, mask_pix, z0, mask_z, cond_z, z_init = _prepare_latents(
+        target, sch, item, args, device)
+    cond_emb, uncond_emb = _get_emb(target, item, args, z0)
+
+    m_out = os.path.join(args.out_root, method["name"], f"img_{item['idx']:03d}")
+    os.makedirs(m_out, exist_ok=True)
+
+    with torch.no_grad():
+        if method["type"] == "target":
+            (z_out, stats), t_run = timed_run(
+                lambda: baseline_inpaint(
+                    target, z_init.clone(), cond_z, mask_z, sch,
+                    num_inference_steps=method["num_steps"],
+                    guidance_scale=args.guidance_scale,
+                    cond_emb=cond_emb, uncond_emb=uncond_emb,
+                    known_z=z0, blend_known=True,
+                ),
+                device,
+            )
+            target_nfe = stats["target_calls"]
+            draft_nfe = 0
+            accept = ""
+        else:  # freqspec
+            (z_out, stats), t_run = timed_run(
+                lambda: fgsr_inpaint(
+                    target, draft, z_init.clone(), cond_z, mask_z, sch,
+                    num_inference_steps=method["num_steps"],
+                    K=args.K, patch_size=args.patch,
+                    t_spec_start_norm=args.t_spec_start, beta=args.beta,
+                    tol_low=method["tol_low"], tol_high=method["tol_high"],
+                    boundary_weight=args.boundary_weight,
+                    uniform_saliency=False,
+                    dwt=dwt, verbose=False,
+                    guidance_scale=args.guidance_scale,
+                    cond_emb=cond_emb, uncond_emb=uncond_emb,
+                    known_z=z0, blend_known=True,
+                ),
+                device,
+            )
+            target_nfe = stats["target_calls"]
+            draft_nfe = stats["draft_calls"]
+            accept = f"{stats['accept_rate']:.4f}"
+
+    # composite + save (gt = input image, needed for metrics later)
+    out = target.decode_latent(z_out)
+    out = img * (1 - mask_pix) + out * mask_pix
+    save_rgb(img, os.path.join(m_out, "gt.png"))         # ground truth
+    save_rgb(out, os.path.join(m_out, "out.png"))        # method output
+    save_gray(mask_pix, os.path.join(m_out, "mask.png"))
+
+    return [item["idx"], item["image_path"], method["name"],
+            method["num_steps"], round(t_run, 4), target_nfe, draft_nfe, accept]
+
+
+def get_parser():
+    p = argparse.ArgumentParser()
+    p.add_argument("--target_id", type=str, required=True)
+    p.add_argument("--draft_ckpt", type=str, required=True)
+    p.add_argument("--data_root", type=str, required=True)
+    p.add_argument("--out_root", type=str, required=True)
+    p.add_argument("--num_images", type=int, default=100)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--resume", action="store_true")
+
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--target_dtype", type=str, default="fp16",
+                   choices=["fp16", "bf16", "fp32"])
+    p.add_argument("--image_size", type=int, default=1024)
+    p.add_argument("--num_steps", type=int, default=50,
+                   help="Full schedule length for FreqSpec.")
+    p.add_argument("--target_steps", type=int, nargs="+",
+                   default=[50, 40, 37, 30, 25],
+                   help="Step counts for reduced-step target baselines.")
+    p.add_argument("--guidance_scale", type=float, default=7.5)
+    p.add_argument("--auto_prompt", action="store_true")
+    p.add_argument("--use_ema_draft", action="store_true",
+                   help="Use EMA draft weights if available (recommended).")
+    p.add_argument("--K", type=int, default=3)
+    p.add_argument("--patch", type=int, default=4)
+    p.add_argument("--t_spec_start", type=float, default=0.7)
+    p.add_argument("--beta", type=float, default=10.0)
+    p.add_argument("--boundary_weight", type=float, default=1.0)
+    return p
+
+
+if __name__ == "__main__":
+    main(get_parser().parse_args())
