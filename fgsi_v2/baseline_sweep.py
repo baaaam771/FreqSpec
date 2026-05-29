@@ -147,6 +147,26 @@ def save_gray(t, path):
 # ====================================================================
 # Manifest: fixed list of images shared by all methods
 # ====================================================================
+def _load_coco_caption_map(caption_json_path):
+    """Load COCO captions JSON and return {file_name: [caption, ...]}.
+    Matches the loading logic in training.train.ImageDataset exactly."""
+    import json
+    with open(caption_json_path) as f:
+        data = json.load(f)
+    id_to_fn = {im["id"]: im["file_name"] for im in data["images"]}
+    caption_map = {}
+    for ann in data["annotations"]:
+        fn = id_to_fn.get(ann["image_id"])
+        if fn is None:
+            continue
+        caption_map.setdefault(fn, []).append(ann["caption"])
+    n = sum(1 for k in caption_map if caption_map[k])
+    avg = sum(len(v) for v in caption_map.values()) / max(1, n)
+    print(f"[sweep] loaded captions for {n} COCO images "
+          f"(avg {avg:.1f} caps/img)")
+    return caption_map
+
+
 def build_manifest(args):
     """Collect num_images images deterministically (seed-fixed)."""
     root = Path(args.data_root)
@@ -159,13 +179,26 @@ def build_manifest(args):
     rng.shuffle(all_imgs)
     chosen = all_imgs[:args.num_images]
 
+    # COCO caption map (if --caption_json given)
+    caption_map = {}
+    if args.caption_json:
+        caption_map = _load_coco_caption_map(args.caption_json)
+
     manifest = []
+    n_with_caption = 0
     for idx, img_path in enumerate(chosen):
         # per-image deterministic seed for mask + diffusion noise
         img_seed = args.seed * 100000 + idx
         prompt = ""
-        if args.auto_prompt:
-            # use the project's own path->prompt logic for consistency
+        # Priority: COCO caption > auto_prompt (path-based) > empty
+        if caption_map:
+            fn = os.path.basename(img_path)
+            caps = caption_map.get(fn, [])
+            if caps:
+                # deterministic per-image caption pick (first one)
+                prompt = caps[0]
+                n_with_caption += 1
+        if not prompt and args.auto_prompt:
             try:
                 from training.train import _path_to_prompt
                 prompt = _path_to_prompt(img_path)
@@ -179,6 +212,13 @@ def build_manifest(args):
             "prompt": prompt,
             "seed": img_seed,
         })
+    if caption_map:
+        print(f"[sweep] {n_with_caption}/{len(manifest)} images got per-image "
+              f"captions from the COCO JSON")
+        # Show a few examples so you can sanity-check
+        for item in manifest[:3]:
+            print(f"  example: {os.path.basename(item['image_path'])} -> "
+                  f"\"{item['prompt']}\"")
     return manifest
 
 
@@ -406,6 +446,10 @@ def get_parser():
                    help="Step counts for reduced-step target baselines.")
     p.add_argument("--guidance_scale", type=float, default=7.5)
     p.add_argument("--auto_prompt", action="store_true")
+    p.add_argument("--caption_json", type=str, default="",
+                   help="Path to COCO captions JSON. If given, per-image "
+                        "captions from the JSON are used as prompts "
+                        "(matches the training pipeline for COCO drafts).")
     p.add_argument("--use_ema_draft", action="store_true",
                    help="Use EMA draft weights if available (recommended).")
     p.add_argument("--K", type=int, default=3)
