@@ -94,21 +94,40 @@ def load_image(path, size):
     ])(img).unsqueeze(0)
 
 
-def make_mask(size, rng, box_prob=0.5):
+def make_mask(size, rng, p_box=0.4):
     """
-    Generate a synthetic mask deterministically from rng.
-    Mirrors the train/eval mask style: box or large rectangle.
+    Generate a synthetic mask using the SAME distribution as training
+    (training.train.random_inpaint_mask): box (40%) or irregular brush
+    strokes (60%). Uses the provided rng for deterministic per-image masks.
+
     Returns 1x1xHxW float (1 = masked/inpaint region).
     """
+    import math
     H = W = size
     m = torch.zeros(1, 1, H, W)
-    # central-ish box covering 12-25% area
-    area_frac = rng.uniform(0.12, 0.25)
-    bh = int((area_frac ** 0.5) * H)
-    bw = int((area_frac ** 0.5) * W)
-    top = rng.randint(0, H - bh)
-    left = rng.randint(0, W - bw)
-    m[:, :, top:top + bh, left:left + bw] = 1.0
+    if rng.random() < p_box:
+        # box mask: random size H/8 .. H/2
+        bh = rng.randint(H // 8, H // 2)
+        bw = rng.randint(W // 8, W // 2)
+        y = rng.randint(0, H - bh)
+        x = rng.randint(0, W - bw)
+        m[:, :, y:y + bh, x:x + bw] = 1.0
+    else:
+        # irregular brush strokes: 3..8 segments
+        n_strokes = rng.randint(3, 8)
+        for _ in range(n_strokes):
+            y = rng.randint(0, H - 1)
+            x = rng.randint(0, W - 1)
+            length = rng.randint(H // 8, H // 3)
+            angle = rng.uniform(0, 2 * math.pi)
+            thick = rng.randint(3, max(4, H // 16))
+            for s in range(length):
+                yy = int(y + s * math.sin(angle))
+                xx = int(x + s * math.cos(angle))
+                if 0 <= yy < H and 0 <= xx < W:
+                    m[:, :,
+                      max(0, yy - thick):min(H, yy + thick),
+                      max(0, xx - thick):min(W, xx + thick)] = 1.0
     return m
 
 
