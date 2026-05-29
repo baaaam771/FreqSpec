@@ -100,6 +100,9 @@ class RegionMetrics:
     @torch.no_grad()
     def compute(self, pred, gt, mask):
         """
+        Ground-truth based metrics: how close is the restoration to the
+        original image. This is the TRUE inpainting quality.
+
         Args:
             pred: HWC predicted image (uint8 or float[0,1])
             gt:   HWC ground-truth image
@@ -119,7 +122,6 @@ class RegionMetrics:
 
         # --- Masked-region metrics ---
         m3 = mask_bin[..., None]
-        # masked PSNR: only over masked pixels
         diff2 = ((pred01 - gt01) ** 2) * m3
         denom = m3.sum() * 3 + 1e-8
         mse_masked = diff2.sum() / denom
@@ -137,6 +139,41 @@ class RegionMetrics:
             "masked_psnr": float(masked_psnr),
             "masked_lpips": float(masked_lpips),
             "boundary_lpips": float(boundary_lpips),
+        }
+
+    @torch.no_grad()
+    def compute_vs_target(self, pred, target_out, mask):
+        """
+        Target-deviation metrics: how closely does the method reproduce the
+        full-quality target (target_s50) output. This matches the ORIGINAL
+        compute_metrics.py criterion (baseline-vs-method LPIPS) and measures
+        target fidelity, NOT restoration quality.
+
+        Args:
+            pred:       HWC method output
+            target_out: HWC the full-step target output (target_s50)
+            mask:       HxW binary
+        Returns dict with keys suffixed '_vs_tgt'.
+        """
+        pred01 = _to_float01(pred)
+        tgt01 = _to_float01(target_out)
+        mask_bin = (mask > 0.5).astype(np.float32)
+        if mask_bin.ndim == 3:
+            mask_bin = mask_bin[..., 0]
+
+        # full-image LPIPS / PSNR against target output
+        lpips_t = self._lpips_full(pred01, tgt01)
+        psnr_t = sk_psnr(tgt01, pred01, data_range=1.0)
+        # masked-region (matches original "PSNR over mask" style)
+        masked_lpips_t = self._lpips_region(pred01, tgt01, mask_bin)
+        band = make_boundary_band(mask_bin, k=self.boundary_k)
+        boundary_lpips_t = self._lpips_region(pred01, tgt01, band)
+
+        return {
+            "lpips_vs_tgt": float(lpips_t),
+            "psnr_vs_tgt": float(psnr_t),
+            "masked_lpips_vs_tgt": float(masked_lpips_t),
+            "boundary_lpips_vs_tgt": float(boundary_lpips_t),
         }
 
 
