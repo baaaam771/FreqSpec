@@ -116,13 +116,11 @@ def build_iqa_metrics(device):
 # ============================================================
 def compute_fid_kid(method_dir, real_dir, n_real, device):
     """
-    Compute FID + KID between method outputs (in method_dir/img_*/out.png)
-    and a sample of real photographs (real_dir).
+    Compute FID + KID between method outputs and a sample of real photographs.
 
-    Strategy:
-      - copy method outputs into a flat staging folder so clean-fid can read.
-      - if n_real is set and real_dir has more images, use mode='clean' with
-        the real_dir directly (clean-fid will use all images under it).
+    Note: uses num_workers=0 to avoid Python 3.14 multiprocessing pickle errors
+    (clean-fid's internal resizer is a local function and not picklable under
+    forkserver, which became default in 3.14).
     """
     from cleanfid import fid as cleanfid
 
@@ -133,17 +131,15 @@ def compute_fid_kid(method_dir, real_dir, n_real, device):
         for p in list_method_outputs(method_dir):
             target = stage / f"{p.parent.name}.png"
             if not target.exists():
-                # symlink to avoid copies
                 target.symlink_to(p.resolve())
 
-    # compute FID / KID
     score_fid = cleanfid.compute_fid(
         str(stage), str(real_dir), mode="clean", device=device,
-        num_workers=2, batch_size=8,
+        num_workers=0, batch_size=8,
     )
     score_kid = cleanfid.compute_kid(
         str(stage), str(real_dir), mode="clean", device=device,
-        num_workers=2, batch_size=8,
+        num_workers=0, batch_size=8,
     )
     return score_fid, score_kid
 

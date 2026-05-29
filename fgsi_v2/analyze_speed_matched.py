@@ -175,8 +175,12 @@ def main(args):
     # ---- print full summary: (B) target-deviation ----
     if has_vs_tgt:
         print(f"\n{'='*100}")
-        print(f"(B) TARGET-DEVIATION METRICS — {args.dataset_name}  "
-              f"[fidelity to {ref_name} output; original paper criterion]")
+        print(f"(B) TARGET-DIVERGENCE METRICS — {args.dataset_name}  "
+              f"[divergence from {ref_name} output]")
+        print(f"    Lower = closer to target (fidelity view).")
+        print(f"    Higher = more diverse plausible completion (diversity view).")
+        print(f"    For inpainting (multi-modal task), high divergence is NOT")
+        print(f"    inherently bad — it can indicate semantic diversity.")
         print(f"{'='*100}")
         hdr2 = (f"{'method':22} {'speedup':>8} "
                 f"{'LPIPS_t':>8} {'PSNR_t':>7} {'mLPIPS_t':>9} {'bLPIPS_t':>9}")
@@ -191,7 +195,12 @@ def main(args):
                   f"{s['masked_lpips_vs_tgt']:>9.4f} "
                   f"{s['boundary_lpips_vs_tgt']:>9.4f}")
         print(f"\n  Note: target_s{args.ref_steps} vs itself = 0 (it is the "
-              f"reference). Lower LPIPS_t = closer to full-step target output.")
+              f"reference).")
+        print(f"  For target-fidelity scenarios (e.g. video frame consistency):")
+        print(f"    lower divergence = better.")
+        print(f"  For inpainting quality (multi-modal, no single right answer):")
+        print(f"    divergence alone does not measure quality — combine with")
+        print(f"    no-reference IQA (CLIP-IQA, MUSIQ) and FID to assess.")
 
     # ---- speed-matched pairs ----
     print(f"\n{'='*100}")
@@ -219,14 +228,17 @@ def main(args):
             fv, tv = sf[k], st[k]
             win = ("FreqSpec" if (fv < tv) == lower_better else "Target")
             print(f"    {k:22} {fv:>10.4f} {tv:>10.4f} {win:>8}")
-        # (B) target-deviation metrics
+        # (B) target-divergence metrics — interpret BOTH ways
         if "lpips_vs_tgt" in sf and "lpips_vs_tgt" in st:
-            print(f"    -- target-deviation (fidelity to {ref_name}) --")
+            print(f"    -- target-divergence (vs {ref_name}, two views) --")
             for k in ["lpips_vs_tgt", "masked_lpips_vs_tgt",
                       "boundary_lpips_vs_tgt"]:
                 fv, tv = sf[k], st[k]
-                win = "FreqSpec" if fv < tv else "Target"
-                print(f"    {k:22} {fv:>10.4f} {tv:>10.4f} {win:>8}")
+                # both interpretations
+                fid_winner = "FreqSpec" if fv < tv else "Target"
+                div_winner = "FreqSpec" if fv > tv else "Target"
+                annot = f"fid:{fid_winner} / div:{div_winner}"
+                print(f"    {k:22} {fv:>10.4f} {tv:>10.4f}  {annot}")
 
     # ---- LaTeX table ----
     latex = build_latex_table(summary, pairs, args.dataset_name)
