@@ -71,19 +71,6 @@ def fgsr_inpaint(
     uncond_emb=None,
     known_z=None,
     blend_known: bool = True,
-    # === Quick-fix knobs (default behavior = original) ===
-    # Fix #2: pred_x0 disagreement gate. Accept requires
-    #   ||pred_x0_draft - pred_x0_target||^2 < x0_threshold (per-patch).
-    # None disables this gate (original behavior).
-    x0_threshold: float = None,
-    # Fix #1: more conservative spec-K -> spec-1 switching threshold.
-    # Default 0.6 = original. Raise to 0.75 to fall back to spec-1 sooner.
-    k_switch_threshold: float = 0.6,
-    # Fix #1b: force spec-1 in the late detail phase (t/T below this).
-    # 0.0 disables; e.g. 0.4 means spec-1 once t/T < 0.4.
-    spec1_below_tnorm: float = 0.0,
-    # Diagnostic logging (per-step eps/x0 drift). Off by default.
-    log_diagnostics: bool = False,
 ):
     """
     Returns:
@@ -163,26 +150,9 @@ def fgsr_inpaint(
         eps_d = draft(z, t_tensor, cond_z, mask_z)
         draft_calls += 1
 
-        # (b.5) Fix #2: predicted x0 estimates (used for the x0_threshold gate
-        # and for diagnostics). pred_x0 = (z - sqrt(1-a_t) * eps) / sqrt(a_t).
-        # alphas_cumprod is on scheduler.device but our t_cur is an int.
-        sa = scheduler.sqrt_alphas_cumprod[t_cur].view(1, 1, 1, 1)
-        som = scheduler.sqrt_one_minus_alphas_cumprod[t_cur].view(1, 1, 1, 1)
-        x0_t = (z - som * eps_t) / sa
-        x0_d = (z - som * eps_d) / sa
-        # per-patch mean-squared x0 disagreement (channel-mean, then avg-pool)
-        x0_delta = ((x0_d - x0_t) ** 2).mean(dim=1, keepdim=True)
-        x0_delta_patch = F.avg_pool2d(x0_delta, patch_size, stride=patch_size)
-
         # (c) per-patch agreement and accept decision
         a_patch = patch_agreement(eps_d, eps_t, patch_size, beta)
-        accept_eps = (a_patch > (1 - tol_patch))
-        if x0_threshold is not None:
-            # Fix #2: also require pred_x0 agreement
-            accept_x0 = (x0_delta_patch < x0_threshold)
-            accept_patch = (accept_eps & accept_x0).float()
-        else:
-            accept_patch = accept_eps.float()
+        accept_patch = (a_patch > (1 - tol_patch)).float()
 
         # NOTE: 마스크 외부 patch에 대해서는 force-accept를 하지 않는다.
         # 이유: draft가 마스크 외부에서 정확하지 않으면 (학습 데이터의 마스크 분포 영향),
@@ -208,26 +178,7 @@ def fgsr_inpaint(
         z_next, _ = scheduler.ddim_step(z, eps_mix, t_cur, t_prev)
         z_next = _blend(z_next, t_prev)
 
-        # Diagnostic logging (off by default)
-        if log_diagnostics:
-            eps_drift = (eps_d - eps_t).pow(2).mean().item()
-            x0_drift = x0_delta.mean().item()
-            print(f"  [diag] t={t_cur:4d}  t_norm={t_norm:.3f}  "
-                  f"accept={accept_rate:.3f}  "
-                  f"eps_drift={eps_drift:.5f}  x0_drift={x0_drift:.5f}  "
-                  f"sal_mean={sal.mean().item():.3f}")
-
-        # Fix #1: spec-K -> spec-1 gating.
-        # Two new conditions, both default to original behavior:
-        #   - higher k_switch_threshold = fall back to spec-1 more aggressively
-        #   - spec1_below_tnorm > 0 = force spec-1 in the late detail phase
-        use_specK = (
-            (accept_rate > k_switch_threshold)
-            and (K > 1)
-            and ((i + K) <= N)
-            and (t_norm >= spec1_below_tnorm)
-        )
-        if use_specK:
+        if accept_rate > 0.6 and K > 1 and (i + K) <= N:
             z = z_next
             for k in range(1, K):
                 if (i + k + 1) > N: break

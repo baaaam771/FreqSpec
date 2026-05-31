@@ -407,11 +407,6 @@ def run_one(target, draft, sch, dwt, item, method, args, device):
                     guidance_scale=args.guidance_scale,
                     cond_emb=cond_emb, uncond_emb=uncond_emb,
                     known_z=z0, blend_known=True,
-                    # Quick-fix forwards
-                    x0_threshold=args.x0_threshold,
-                    k_switch_threshold=args.k_switch_threshold,
-                    spec1_below_tnorm=args.spec1_below_tnorm,
-                    log_diagnostics=args.log_diagnostics,
                 ),
                 device,
             )
@@ -462,24 +457,6 @@ def get_parser():
     p.add_argument("--t_spec_start", type=float, default=0.7)
     p.add_argument("--beta", type=float, default=10.0)
     p.add_argument("--boundary_weight", type=float, default=1.0)
-    # --- Quick-fix knobs (forwarded to fgsr_inpaint) ---
-    p.add_argument("--x0_threshold", type=float, default=None,
-                   help="Fix #2: pred_x0 disagreement gate. Per-patch "
-                        "MSE threshold between pred_x0_draft and "
-                        "pred_x0_target. None disables the gate. "
-                        "Suggested sweep: 0.01 / 0.02 / 0.05.")
-    p.add_argument("--k_switch_threshold", type=float, default=0.6,
-                   help="Fix #1: rolling accept threshold above which "
-                        "spec-K (K>1) is used. Default 0.6 (original). "
-                        "Raise to e.g. 0.75 to fall back to spec-1 sooner.")
-    p.add_argument("--spec1_below_tnorm", type=float, default=0.0,
-                   help="Fix #1b: force spec-1 once t/T < this value. "
-                        "0.0 disables. Try 0.4 to use spec-1 in the late "
-                        "detail phase.")
-    p.add_argument("--log_diagnostics", action="store_true",
-                   help="Print per-timestep eps_drift / x0_drift / "
-                        "accept_rate. Useful to find where trajectories "
-                        "diverge.")
     return p
 
 
