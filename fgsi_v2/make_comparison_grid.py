@@ -160,8 +160,11 @@ def pick_diverse(sweep_root, n, fs_method="freqspec_default",
 # Building one grid
 # ============================================================
 def build_grid(sweep_root, method_dirs, idx, summary, cell_size, font,
-               include_gt=True, include_mask=True):
-    """Produce one PIL image: GT | Mask | method_1 | method_2 | ..."""
+               include_gt=True, include_mask=True, cols_per_row=None):
+    """Produce one PIL image: GT | Mask | method_1 | method_2 | ...
+
+    If cols_per_row is set, wraps into multiple rows (better for screen viewing).
+    """
     cells = []
 
     # GT and mask (any method dir has them)
@@ -184,13 +187,26 @@ def build_grid(sweep_root, method_dirs, idx, summary, cell_size, font,
         label = best_label(mdir.name, summary)
         cells.append(label_image(img, label, font))
 
-    # tile horizontally
     if not cells:
         return None
     cw, ch = cells[0].size
-    grid = Image.new("RGB", (cw * len(cells), ch), color=(255, 255, 255))
-    for i, c in enumerate(cells):
-        grid.paste(c, (i * cw, 0))
+
+    # tile — single row OR multi-row wrap
+    if cols_per_row is None or cols_per_row >= len(cells):
+        # original behavior: one wide row
+        grid = Image.new("RGB", (cw * len(cells), ch), color=(255, 255, 255))
+        for i, c in enumerate(cells):
+            grid.paste(c, (i * cw, 0))
+    else:
+        # multi-row wrap
+        n_rows = (len(cells) + cols_per_row - 1) // cols_per_row
+        grid = Image.new("RGB",
+                         (cw * cols_per_row, ch * n_rows),
+                         color=(255, 255, 255))
+        for i, c in enumerate(cells):
+            r = i // cols_per_row
+            col = i % cols_per_row
+            grid.paste(c, (col * cw, r * ch))
     return grid
 
 
@@ -233,6 +249,7 @@ def main(args):
         grid = build_grid(
             sweep_root, method_dirs, idx, summary,
             cell_size=args.cell_size, font=font,
+            cols_per_row=(args.cols_per_row if args.cols_per_row > 0 else None),
         )
         if grid is None:
             print(f"[grid] skipping idx {idx} (no images)")
@@ -260,6 +277,10 @@ def get_parser():
                         "freqspec_default and target_s40 disagree most.")
     p.add_argument("--cell_size", type=int, default=384,
                    help="Side length of each method cell in pixels.")
+    p.add_argument("--cols_per_row", type=int, default=5,
+                   help="Number of cells per row before wrapping to a new row. "
+                        "Default 5 gives a roughly square grid for 8-10 methods. "
+                        "Set to 0 to keep everything on one wide row.")
     return p
 
 
