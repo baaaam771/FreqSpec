@@ -115,12 +115,6 @@ def fgsr_inpaint(
     x0_thr_loose:  float = None,    # loose value far from center
     x0_strict_center: float = None, # t_norm peak of strictness; None = disable
     x0_strict_width:  float = 0.12, # Gaussian width
-    # === Fix #6 (NEW): Drift-based K-switch ===
-    # When set, also force spec-1 if rolling x0_drift exceeds this threshold.
-    # The original logic switches only on accept_rate; this adds a safety
-    # signal based on actual trajectory drift.
-    # None disables (keeps original behavior). Try 0.004, 0.006, 0.008.
-    drift_k_switch_threshold: float = None,
 ):
     """
     Returns:
@@ -283,29 +277,21 @@ def fgsr_inpaint(
         z_next, _ = scheduler.ddim_step(z, eps_mix, t_cur, t_prev)
         z_next = _blend(z_next, t_prev)
 
-        # Compute x0_drift (used by Fix #6 K-switch AND diagnostics).
-        # x0_delta is already computed above for the x0 gate.
-        x0_drift = x0_delta.mean().item()
-
         # Diagnostic logging (off by default)
         if log_diagnostics:
             eps_drift = (eps_d - eps_t).pow(2).mean().item()
+            x0_drift = x0_delta.mean().item()
             print(f"  [diag] t={t_cur:4d}  t_norm={t_norm:.3f}  "
                   f"accept={accept_rate:.3f}  "
                   f"eps_drift={eps_drift:.5f}  x0_drift={x0_drift:.5f}  "
                   f"sal_mean={sal.mean().item():.3f}")
 
-        # Fix #1: spec-K -> spec-1 gating (accept-rate based).
-        # Fix #6 (NEW): also fall back to spec-1 if x0_drift is too large,
-        # regardless of accept_rate. This catches the case where many patches
-        # are accepted but they're individually drifting badly.
-        drift_ok = True
-        if drift_k_switch_threshold is not None:
-            drift_ok = (x0_drift < drift_k_switch_threshold)
-
+        # Fix #1: spec-K -> spec-1 gating.
+        # Two new conditions, both default to original behavior:
+        #   - higher k_switch_threshold = fall back to spec-1 more aggressively
+        #   - spec1_below_tnorm > 0 = force spec-1 in the late detail phase
         use_specK = (
             (accept_rate > k_switch_threshold)
-            and drift_ok
             and (K > 1)
             and ((i + K) <= N)
             and (t_norm >= spec1_below_tnorm)

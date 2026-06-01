@@ -418,7 +418,6 @@ def run_one(target, draft, sch, dwt, item, method, args, device):
                     x0_thr_loose=args.x0_thr_loose,
                     x0_strict_center=args.x0_strict_center,
                     x0_strict_width=args.x0_strict_width,
-                    drift_k_switch_threshold=args.drift_k_switch_threshold,
                 ),
                 device,
             )
@@ -507,10 +506,6 @@ def get_parser():
     p.add_argument("--x0_strict_width", type=float, default=0.12,
                    help="Fix #4: Gaussian width of the strictness peak. "
                         "Default 0.12 covers t/T 0.33-0.57.")
-    p.add_argument("--drift_k_switch_threshold", type=float, default=None,
-                   help="Fix #6: force spec-1 when x0_drift exceeds this. "
-                        "None disables. Try 0.004 / 0.006 / 0.008. "
-                        "Diagnostic showed peak drift ~0.009 at t/T=0.45.")
     return p
 
 
