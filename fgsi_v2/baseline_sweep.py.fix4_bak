@@ -413,10 +413,6 @@ def run_one(target, draft, sch, dwt, item, method, args, device):
                     spec1_below_tnorm=args.spec1_below_tnorm,
                     log_diagnostics=args.log_diagnostics,
                     blend_temperature=args.blend_temperature,
-                    x0_thr_strict=args.x0_thr_strict,
-                    x0_thr_loose=args.x0_thr_loose,
-                    x0_strict_center=args.x0_strict_center,
-                    x0_strict_width=args.x0_strict_width,
                 ),
                 device,
             )
@@ -489,19 +485,6 @@ def get_parser():
                    help="Fix #3: soft blend temperature. None disables "
                         "(original hard accept/reject). Suggested sweep: "
                         "0.05 (sharp) / 0.10 (medium) / 0.20 (soft).")
-    p.add_argument("--x0_thr_strict", type=float, default=None,
-                   help="Fix #4: strict x0 threshold (used near "
-                        "x0_strict_center). Suggested: 0.02 or 0.03.")
-    p.add_argument("--x0_thr_loose", type=float, default=None,
-                   help="Fix #4: loose x0 threshold (used far from "
-                        "center). Suggested: 0.07 or 0.10.")
-    p.add_argument("--x0_strict_center", type=float, default=None,
-                   help="Fix #4: t_norm peak of strictness. None "
-                        "disables timestep-dependent gate. Diagnostic "
-                        "showed drift spikes near 0.45.")
-    p.add_argument("--x0_strict_width", type=float, default=0.12,
-                   help="Fix #4: Gaussian width of the strictness peak. "
-                        "Default 0.12 covers t/T 0.33-0.57.")
     return p
 
 

@@ -25,7 +25,6 @@ import os
 import sys
 import torch
 import torch.nn.functional as F
-import math
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -94,20 +93,6 @@ def fgsr_inpaint(
     # Smaller temperature -> sharper transition (closer to hard).
     # Larger temperature -> softer blend.
     blend_temperature: float = None,
-    # === Fix #4 (NEW): Timestep-dependent x0 gate ===
-    # When set, the x0 disagreement threshold becomes a function of t_norm,
-    # being strictest near `x0_strict_center` (with `x0_strict_width` Gaussian
-    # bandwidth), and reverting to a looser value elsewhere.
-    # Specifically:
-    #   x0_thr(t_norm) = x0_thr_loose * (1 - s) + x0_thr_strict * s
-    #   where s = exp(-((t_norm - center)^2) / (2 * width^2))
-    # None for x0_strict_center disables this (uses fixed x0_threshold).
-    # Typical: center=0.45, width=0.12 (matches diagnostic finding of drift
-    # spike around t/T = 0.40-0.55).
-    x0_thr_strict: float = None,    # strict value at center
-    x0_thr_loose:  float = None,    # loose value far from center
-    x0_strict_center: float = None, # t_norm peak of strictness; None = disable
-    x0_strict_width:  float = 0.12, # Gaussian width
 ):
     """
     Returns:
@@ -201,22 +186,9 @@ def fgsr_inpaint(
         # (c) per-patch agreement and accept decision
         a_patch = patch_agreement(eps_d, eps_t, patch_size, beta)
         accept_eps = (a_patch > (1 - tol_patch))
-
-        # === Fix #4: Compute effective x0_threshold (possibly t-dependent) ===
-        # If timestep-dependent strictness is enabled, interpolate between
-        # x0_thr_loose and x0_thr_strict using a Gaussian peaked at the
-        # specified center. Otherwise fall back to the fixed x0_threshold.
-        if x0_strict_center is not None and x0_thr_strict is not None and x0_thr_loose is not None:
-            # strictness s in [0, 1]: 1 at center, decays to 0 with width
-            s = float(math.exp(-((t_norm - x0_strict_center) ** 2)
-                               / (2.0 * x0_strict_width ** 2)))
-            x0_thr_effective = x0_thr_loose * (1.0 - s) + x0_thr_strict * s
-        else:
-            x0_thr_effective = x0_threshold
-
-        if x0_thr_effective is not None:
+        if x0_threshold is not None:
             # Fix #2: also require pred_x0 agreement
-            accept_x0 = (x0_delta_patch < x0_thr_effective)
+            accept_x0 = (x0_delta_patch < x0_threshold)
             accept_patch = (accept_eps & accept_x0).float()
         else:
             accept_patch = accept_eps.float()
@@ -254,8 +226,8 @@ def fgsr_inpaint(
             w_patch = torch.sigmoid(margin_patch / blend_temperature)
             # If x0 gate is also active, multiply weights by a soft x0 gate too
             # (sharp around its own threshold).
-            if x0_thr_effective is not None:
-                x0_margin = (x0_thr_effective - x0_delta_patch) / max(blend_temperature, 1e-6)
+            if x0_threshold is not None:
+                x0_margin = (x0_threshold - x0_delta_patch) / max(blend_temperature, 1e-6)
                 w_patch = w_patch * torch.sigmoid(x0_margin)
             # Upsample weights to latent resolution.
             w_full = F.interpolate(w_patch, size=(H, W), mode="nearest")
