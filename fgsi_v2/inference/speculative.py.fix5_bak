@@ -63,13 +63,6 @@ def fgsr_inpaint(
     tol_low: float = 0.05,
     tol_high: float = 0.5,
     boundary_weight: float = 1.0,
-    # === Fix #5 (NEW): Mask interior penalty ===
-    # > 0이면 mask 내부 전체를 hard region으로 추가 표시.
-    # COCO같은 caption-conditioned object completion에서 mask 내부의
-    # semantic mismatch를 잡기 위함. Wavelet/boundary는 texture/seam에는
-    # 강하지만 semantic mismatch는 못 잡음.
-    # 추천 sweep: 0.3 / 0.5 / 0.8 (boundary_weight=1.0과 함께).
-    mask_interior_weight: float = 0.0,
     uniform_saliency: bool = False,
     dwt=None,
     verbose: bool = False,
@@ -179,7 +172,6 @@ def fgsr_inpaint(
         # (a) current saliency from z_t (iterative)
         sal = combined_saliency(z, mask_z, dwt,
                                 boundary_weight=boundary_weight,
-                                interior_weight=mask_interior_weight,
                                 target_size=(H, W),
                                 uniform=uniform_saliency)
         sal_patch = F.avg_pool2d(sal, patch_size, stride=patch_size)

@@ -402,7 +402,6 @@ def run_one(target, draft, sch, dwt, item, method, args, device):
                     t_spec_start_norm=args.t_spec_start, beta=args.beta,
                     tol_low=method["tol_low"], tol_high=method["tol_high"],
                     boundary_weight=args.boundary_weight,
-                    mask_interior_weight=args.mask_interior_weight,
                     uniform_saliency=False,
                     dwt=dwt, verbose=False,
                     guidance_scale=args.guidance_scale,
@@ -468,9 +467,6 @@ def get_parser():
     p.add_argument("--t_spec_start", type=float, default=0.7)
     p.add_argument("--beta", type=float, default=10.0)
     p.add_argument("--boundary_weight", type=float, default=1.0)
-    p.add_argument("--mask_interior_weight", type=float, default=0.0,
-                   help="Fix #5: penalize mask interior in saliency. 0 "
-                        "disables. Try 0.3/0.5/0.8.")
     # --- Quick-fix knobs (forwarded to fgsr_inpaint) ---
     p.add_argument("--x0_threshold", type=float, default=None,
                    help="Fix #2: pred_x0 disagreement gate. Per-patch "
