@@ -37,7 +37,7 @@ DRAFT_CKPT="$3"
 CAPTION_JSON="${4:-}"
 
 # === Output dir ===
-OUT_ROOT="/mnt/HDD_12TB/bam_ki/results/qualitative_${DATASET}_run"
+OUT_ROOT="/mnt/HDD_12TB/bam_ki/results/qualitative_${DATASET}_run100"
 
 # === SDXL target (same for all datasets) ===
 TARGET_ID="/mnt/HDD_12TB/bam_ki/checkpoints/stable-diffusion-xl-1.0-inpainting-0.1"
