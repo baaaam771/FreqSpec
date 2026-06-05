@@ -1,15 +1,25 @@
 """
 Frequency-Guided Speculative Refinement (FGSR) for ε-prediction inpainting.
 
-[PATCHED]: adds optional `return_usage_map=True` which collects the
-per-verified-timestep soft-blend weight w(p) (or hard accept indicator)
-and returns the time-averaged usage map in stats["usage_map"].
-The map has shape [B, 1, H_lat, W_lat], values in [0, 1], where 1 means
-"draft fully used" and 0 means "target fallback". The mask-outside
-region is excluded from the average (always 0).
-
 Target은 frozen pretrained SD-Inpainting, Draft는 학습된 작은 모델.
 두 모델 모두 동일한 ε-prediction 인터페이스를 가지므로 직접 비교 가능.
+
+Algorithm (한 DDIM step at timestep t):
+1. t > t_spec_start_norm: target으로만 진행 (saliency 안정화)
+2. t ≤ t_spec_start_norm: speculative phase
+   a. 현재 z_t에서 saliency 계산
+   b. ε_target = target(z_t, t, cond, mask)
+   c. ε_draft  = draft (z_t, t, cond, mask)
+   d. patch별 agreement score: a = exp(-β ||ε_target - ε_draft||²)
+   e. patch별 tolerance: tol = tol_low + (tol_high - tol_low)*(1-saliency)
+   f. accept patch가 어디인지 결정
+   g. z_t_next 합성:
+       - accept (평탄): draft ε로 DDIM step
+       - reject (어려움): target ε로 DDIM step
+3. Accept rate가 높으면 draft로 K step 추가 진행 (target call 절약)
+
+Option B (default): velocity-agreement = "distribution-aware refinement"
+Option A (stub): divergence-based density ratio (Hutchinson estimator)
 """
 import os
 import sys
@@ -28,8 +38,8 @@ from training.scheduler import DDPMSchedule
 # ============================================================
 def patch_agreement(eps_a, eps_b, patch_size: int, beta: float):
     """Per-patch agreement: a = exp(-β · mean_channel ||eps_a - eps_b||²)."""
-    diff_sq = (eps_a - eps_b).pow(2).mean(dim=1, keepdim=True)
-    diff_patch = F.avg_pool2d(diff_sq, patch_size, stride=patch_size)
+    diff_sq = (eps_a - eps_b).pow(2).mean(dim=1, keepdim=True)         # [B,1,H,W]
+    diff_patch = F.avg_pool2d(diff_sq, patch_size, stride=patch_size)  # [B,1,Hp,Wp]
     return torch.exp(-beta * diff_patch)
 
 
@@ -38,13 +48,14 @@ def patch_agreement(eps_a, eps_b, patch_size: int, beta: float):
 # ============================================================
 @torch.no_grad()
 def fgsr_inpaint(
-    target,
-    draft,
-    z_init: torch.Tensor,
-    cond_z: torch.Tensor,
-    mask_z: torch.Tensor,
+    target,                        # TargetWrapper instance
+    draft,                         # DraftEpsUNet
+    z_init: torch.Tensor,          # [B,4,Hl,Wl] noise latent
+    cond_z: torch.Tensor,          # [B,4,Hl,Wl] masked-image latent
+    mask_z: torch.Tensor,          # [B,1,Hl,Wl]
     scheduler: DDPMSchedule,
     num_inference_steps: int = 50,
+    # FGSR hyperparams
     K: int = 3,
     patch_size: int = 4,
     t_spec_start_norm: float = 0.7,
@@ -52,37 +63,71 @@ def fgsr_inpaint(
     tol_low: float = 0.05,
     tol_high: float = 0.5,
     boundary_weight: float = 1.0,
+    # === Fix #5 (NEW): Mask interior penalty ===
+    # > 0이면 mask 내부 전체를 hard region으로 추가 표시.
+    # COCO같은 caption-conditioned object completion에서 mask 내부의
+    # semantic mismatch를 잡기 위함. Wavelet/boundary는 texture/seam에는
+    # 강하지만 semantic mismatch는 못 잡음.
+    # 추천 sweep: 0.3 / 0.5 / 0.8 (boundary_weight=1.0과 함께).
     mask_interior_weight: float = 0.0,
     uniform_saliency: bool = False,
     dwt=None,
     verbose: bool = False,
+    # CFG / blending
     guidance_scale: float = 1.0,
     cond_emb=None,
     uncond_emb=None,
     known_z=None,
     blend_known: bool = True,
+    # === Quick-fix knobs (default behavior = original) ===
+    # Fix #2: pred_x0 disagreement gate. Accept requires
+    #   ||pred_x0_draft - pred_x0_target||^2 < x0_threshold (per-patch).
+    # None disables this gate (original behavior).
     x0_threshold: float = None,
+    # Fix #1: more conservative spec-K -> spec-1 switching threshold.
+    # Default 0.6 = original. Raise to 0.75 to fall back to spec-1 sooner.
     k_switch_threshold: float = 0.6,
+    # Fix #1b: force spec-1 in the late detail phase (t/T below this).
+    # 0.0 disables; e.g. 0.4 means spec-1 once t/T < 0.4.
     spec1_below_tnorm: float = 0.0,
+    # Diagnostic logging (per-step eps/x0 drift). Off by default.
     log_diagnostics: bool = False,
+    # === Fix #3 (NEW): Soft blend ===
+    # When set, replaces hard accept/reject at threshold boundary with
+    # a sigmoid-weighted blend:
+    #   w = sigmoid((agreement_margin) / blend_temperature)
+    #   eps_final = eps_target + w * (eps_draft - eps_target)
+    # blend_temperature = None disables (keeps original hard behavior).
+    # Smaller temperature -> sharper transition (closer to hard).
+    # Larger temperature -> softer blend.
     blend_temperature: float = None,
-    x0_thr_strict: float = None,
-    x0_thr_loose:  float = None,
-    x0_strict_center: float = None,
-    x0_strict_width:  float = 0.12,
+    # === Fix #4 (NEW): Timestep-dependent x0 gate ===
+    # When set, the x0 disagreement threshold becomes a function of t_norm,
+    # being strictest near `x0_strict_center` (with `x0_strict_width` Gaussian
+    # bandwidth), and reverting to a looser value elsewhere.
+    # Specifically:
+    #   x0_thr(t_norm) = x0_thr_loose * (1 - s) + x0_thr_strict * s
+    #   where s = exp(-((t_norm - center)^2) / (2 * width^2))
+    # None for x0_strict_center disables this (uses fixed x0_threshold).
+    # Typical: center=0.45, width=0.12 (matches diagnostic finding of drift
+    # spike around t/T = 0.40-0.55).
+    x0_thr_strict: float = None,    # strict value at center
+    x0_thr_loose:  float = None,    # loose value far from center
+    x0_strict_center: float = None, # t_norm peak of strictness; None = disable
+    x0_strict_width:  float = 0.12, # Gaussian width
+    # === Fix #6 (NEW): Drift-based K-switch ===
+    # When set, also force spec-1 if rolling x0_drift exceeds this threshold.
+    # The original logic switches only on accept_rate; this adds a safety
+    # signal based on actual trajectory drift.
+    # None disables (keeps original behavior). Try 0.004, 0.006, 0.008.
     drift_k_switch_threshold: float = None,
-    # === NEW: usage-map collection for qualitative figures ===
-    # When True, the time-averaged soft-blend weight (or hard accept indicator)
-    # over Phase-2 verified timesteps is returned in stats["usage_map"].
-    return_usage_map: bool = False,
 ):
     """
     Returns:
         z_final, stats
-        If return_usage_map=True, stats["usage_map"] has shape
-        [B, 1, H_lat, W_lat] with values in [0, 1].
     """
     def _blend(z_now, t_next_int):
+        """Re-impose known (non-hole) region at step t_next via q_sample."""
         if not (blend_known and known_z is not None and t_next_int >= 0):
             return z_now
         B_ = z_now.shape[0]
@@ -96,7 +141,7 @@ def fgsr_inpaint(
     if dwt is None:
         dwt = DWT2D("haar").to(device)
 
-    ts = scheduler.get_ddim_schedule(num_inference_steps)
+    ts = scheduler.get_ddim_schedule(num_inference_steps)  # [N] descending int
     N = len(ts)
     z = z_init.clone()
     B, C, H, W = z.shape
@@ -108,16 +153,14 @@ def fgsr_inpaint(
     spec_steps = 0
     stab_steps = 0
 
-    # === NEW: usage-map accumulator ===
-    if return_usage_map:
-        usage_acc = torch.zeros(B, 1, H, W, device=device)
-        usage_count = 0
-
     i = 0
     while i < N:
         t_cur = int(ts[i].item())
         t_prev = int(ts[i + 1].item()) if (i + 1) < N else -1
+
+        # normalized timestep for saliency threshold
         t_norm = t_cur / (scheduler.num_train_timesteps - 1)
+
         t_tensor = torch.full((B,), t_cur, device=device, dtype=torch.long)
 
         # ---------------- Phase 1: stabilization ----------------
@@ -139,6 +182,7 @@ def fgsr_inpaint(
         # ---------------- Phase 2: speculative refinement ----------------
         spec_steps += 1
 
+        # (a) current saliency from z_t (iterative)
         sal = combined_saliency(z, mask_z, dwt,
                                 boundary_weight=boundary_weight,
                                 interior_weight=mask_interior_weight,
@@ -147,6 +191,7 @@ def fgsr_inpaint(
         sal_patch = F.avg_pool2d(sal, patch_size, stride=patch_size)
         tol_patch = tol_low + (tol_high - tol_low) * (1 - sal_patch)
 
+        # (b) target + draft eps at current step
         eps_t = target.predict_eps(
             z, t_tensor, cond_z, mask_z,
             cond_emb=cond_emb, uncond_emb=uncond_emb,
@@ -156,17 +201,27 @@ def fgsr_inpaint(
         eps_d = draft(z, t_tensor, cond_z, mask_z)
         draft_calls += 1
 
+        # (b.5) Fix #2: predicted x0 estimates (used for the x0_threshold gate
+        # and for diagnostics). pred_x0 = (z - sqrt(1-a_t) * eps) / sqrt(a_t).
+        # alphas_cumprod is on scheduler.device but our t_cur is an int.
         sa = scheduler.sqrt_alphas_cumprod[t_cur].view(1, 1, 1, 1)
         som = scheduler.sqrt_one_minus_alphas_cumprod[t_cur].view(1, 1, 1, 1)
         x0_t = (z - som * eps_t) / sa
         x0_d = (z - som * eps_d) / sa
+        # per-patch mean-squared x0 disagreement (channel-mean, then avg-pool)
         x0_delta = ((x0_d - x0_t) ** 2).mean(dim=1, keepdim=True)
         x0_delta_patch = F.avg_pool2d(x0_delta, patch_size, stride=patch_size)
 
+        # (c) per-patch agreement and accept decision
         a_patch = patch_agreement(eps_d, eps_t, patch_size, beta)
         accept_eps = (a_patch > (1 - tol_patch))
 
+        # === Fix #4: Compute effective x0_threshold (possibly t-dependent) ===
+        # If timestep-dependent strictness is enabled, interpolate between
+        # x0_thr_loose and x0_thr_strict using a Gaussian peaked at the
+        # specified center. Otherwise fall back to the fixed x0_threshold.
         if x0_strict_center is not None and x0_thr_strict is not None and x0_thr_loose is not None:
+            # strictness s in [0, 1]: 1 at center, decays to 0 with width
             s = float(math.exp(-((t_norm - x0_strict_center) ** 2)
                                / (2.0 * x0_strict_width ** 2)))
             x0_thr_effective = x0_thr_loose * (1.0 - s) + x0_thr_strict * s
@@ -174,16 +229,25 @@ def fgsr_inpaint(
             x0_thr_effective = x0_threshold
 
         if x0_thr_effective is not None:
+            # Fix #2: also require pred_x0 agreement
             accept_x0 = (x0_delta_patch < x0_thr_effective)
             accept_patch = (accept_eps & accept_x0).float()
         else:
             accept_patch = accept_eps.float()
 
+        # NOTE: 마스크 외부 patch에 대해서는 force-accept를 하지 않는다.
+        # 이유: draft가 마스크 외부에서 정확하지 않으면 (학습 데이터의 마스크 분포 영향),
+        # force-accept로 draft eps를 적용하면 마스크 외부가 오염될 수 있음.
+        # 안전을 위해 마스크 외부는 항상 target eps 사용.
         mask_patch = F.max_pool2d(mask_z, patch_size, stride=patch_size)
+
         accept_full = F.interpolate(accept_patch, size=(H, W), mode="nearest")
+        # 마스크 외부 (mask_z < 0.5)는 강제로 target eps만 사용 (accept=0)
+        # 마스크 내부는 agreement score 기반 accept 결정 그대로
         mask_full = F.interpolate(mask_patch, size=(H, W), mode="nearest")
         accept_full = accept_full * (mask_full >= 0.5).float()
 
+        # 통계는 마스크 내부 patch에 한해 계산 (외부는 항상 target이라 의미 없음)
         mask_patch_bool = (mask_patch >= 0.5).float()
         n_inner = mask_patch_bool.sum().item()
         n_acc_inner = (accept_patch * mask_patch_bool).sum().item()
@@ -191,31 +255,39 @@ def fgsr_inpaint(
         total_accepted += n_acc_inner
         accept_rate = n_acc_inner / max(n_inner, 1)
 
+        # === Fix #3: soft blend (when blend_temperature is set) ===
+        # Hard mode (default):
+        #     eps_mix = accept_full * eps_d + (1 - accept_full) * eps_t
+        # Soft mode: derive a continuous weight from the agreement margin,
+        # so patches near the threshold blend smoothly rather than flipping.
         if blend_temperature is not None and blend_temperature > 0:
+            # margin = how far above the threshold this patch is.
+            # a_patch in [0,1], threshold = (1 - tol_patch).
+            # Positive margin -> draft should be trusted more.
             margin_patch = a_patch - (1.0 - tol_patch)
             w_patch = torch.sigmoid(margin_patch / blend_temperature)
+            # If x0 gate is also active, multiply weights by a soft x0 gate too
+            # (sharp around its own threshold).
             if x0_thr_effective is not None:
                 x0_margin = (x0_thr_effective - x0_delta_patch) / max(blend_temperature, 1e-6)
                 w_patch = w_patch * torch.sigmoid(x0_margin)
+            # Upsample weights to latent resolution.
             w_full = F.interpolate(w_patch, size=(H, W), mode="nearest")
+            # Mask outside region: force w=0 (always target).
             w_full = w_full * (mask_full >= 0.5).float()
             eps_mix = eps_t + w_full * (eps_d - eps_t)
-            # === NEW: accumulate soft weight ===
-            if return_usage_map:
-                usage_acc = usage_acc + w_full.detach()
-                usage_count = usage_count + 1
         else:
+            # Original hard accept/reject
             eps_mix = accept_full * eps_d + (1 - accept_full) * eps_t
-            # === NEW: accumulate hard accept indicator ===
-            if return_usage_map:
-                usage_acc = usage_acc + accept_full.detach()
-                usage_count = usage_count + 1
 
         z_next, _ = scheduler.ddim_step(z, eps_mix, t_cur, t_prev)
         z_next = _blend(z_next, t_prev)
 
+        # Compute x0_drift (used by Fix #6 K-switch AND diagnostics).
+        # x0_delta is already computed above for the x0 gate.
         x0_drift = x0_delta.mean().item()
 
+        # Diagnostic logging (off by default)
         if log_diagnostics:
             eps_drift = (eps_d - eps_t).pow(2).mean().item()
             print(f"  [diag] t={t_cur:4d}  t_norm={t_norm:.3f}  "
@@ -223,6 +295,10 @@ def fgsr_inpaint(
                   f"eps_drift={eps_drift:.5f}  x0_drift={x0_drift:.5f}  "
                   f"sal_mean={sal.mean().item():.3f}")
 
+        # Fix #1: spec-K -> spec-1 gating (accept-rate based).
+        # Fix #6 (NEW): also fall back to spec-1 if x0_drift is too large,
+        # regardless of accept_rate. This catches the case where many patches
+        # are accepted but they're individually drifting badly.
         drift_ok = True
         if drift_k_switch_threshold is not None:
             drift_ok = (x0_drift < drift_k_switch_threshold)
@@ -265,16 +341,6 @@ def fgsr_inpaint(
         "spec_steps": spec_steps,
         "target_speedup": N / max(target_calls, 1),
     }
-
-    # === NEW: append usage map to stats ===
-    if return_usage_map:
-        if usage_count > 0:
-            usage_map = (usage_acc / usage_count).clamp(0.0, 1.0)
-        else:
-            usage_map = torch.zeros(B, 1, H, W, device=device)
-        stats["usage_map"] = usage_map.cpu()
-        stats["usage_count"] = usage_count
-
     return z, stats
 
 
@@ -286,6 +352,11 @@ def baseline_inpaint(target, z_init, cond_z, mask_z, scheduler,
                      num_inference_steps=50, guidance_scale=1.0,
                      cond_emb=None, uncond_emb=None,
                      known_z=None, blend_known=True):
+    """
+    Args:
+        known_z: clean latent of known (non-hole) region. If provided and blend_known=True,
+                 we re-impose it at every step (standard inpainting blending trick).
+    """
     ts = scheduler.get_ddim_schedule(num_inference_steps)
     N = len(ts)
     z = z_init.clone()
@@ -302,6 +373,7 @@ def baseline_inpaint(target, z_init, cond_z, mask_z, scheduler,
         )
         z, _ = scheduler.ddim_step(z, eps_t, t_cur, t_prev)
 
+        # Re-impose known (non-hole) region: q_sample(z_0_known, t_prev)
         if blend_known and known_z is not None and t_prev >= 0:
             eps_noise = torch.randn_like(known_z)
             z_known_t = scheduler.q_sample(known_z, eps_noise,
@@ -310,3 +382,24 @@ def baseline_inpaint(target, z_init, cond_z, mask_z, scheduler,
             z = mask_z * z + (1 - mask_z) * z_known_t
 
     return z, {"target_calls": N, "nfe_total": N, "accept_rate": None}
+
+
+if __name__ == "__main__":
+    from models.target_wrapper import TargetWrapper
+    from models.draft import DraftEpsUNet
+    torch.manual_seed(0)
+    device = "cpu"
+    target = TargetWrapper("dummy/none", device=device)
+    draft = DraftEpsUNet(latent_ch=4).to(device).eval()
+    sch = DDPMSchedule(device=device)
+
+    z_init = torch.randn(1, 4, 32, 32, device=device)
+    cond = torch.zeros(1, 4, 32, 32, device=device)
+    mask = (torch.rand(1, 1, 32, 32, device=device) > 0.7).float()
+
+    z_b, s_b = baseline_inpaint(target, z_init, cond, mask, sch, num_inference_steps=20)
+    z_s, s_s = fgsr_inpaint(target, draft, z_init, cond, mask, sch,
+                            num_inference_steps=20, K=3, patch_size=4,
+                            verbose=True)
+    print("baseline stats:", s_b)
+    print("fgsr     stats:", s_s)

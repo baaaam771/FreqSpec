@@ -2,16 +2,6 @@
 """
 baseline_sweep.py — Reduced-step baseline vs FreqSpec comparison runner.
 
-[PATCHED] adds 4 minimal changes for qualitative-figure preparation:
-  1. import torch.nn.functional as F            (for usage_map upsampling)
-  2. Combo 2 sanity print at start of main()    (which fixes are active)
-  3. fgsr_inpaint(..., return_usage_map=...)    (when --save_usage_maps)
-  4. save usage_map.png alongside out/gt/mask   (when --save_usage_maps)
-  5. --save_usage_maps argparse flag
-
-Default behavior is unchanged. When --save_usage_maps is NOT passed,
-this script behaves identically to the original.
-
 Reviewer-critical experiment: answers "is FreqSpec better than just reducing
 the target's denoising steps to match the speed?"
 
@@ -23,24 +13,18 @@ fgsr_inpaint from inference.speculative) — no new inference logic. It:
      tolerances) on the SAME manifest.
   3. Times each run with torch.cuda.synchronize() for accurate wall-clock.
   4. Saves per-image outputs and an image-level CSV per method.
-  5. (NEW) Optionally saves draft usage maps for FreqSpec methods.
 
-Example (Combo 2 + usage maps):
+Metrics (Boundary/Masked LPIPS) are computed separately by
+analyze_speed_matched.py, which reads the saved images.
+
+Example:
     python baseline_sweep.py \\
         --target_id /mnt/HDD_12TB/bam_ki/checkpoints/stable-diffusion-xl-1.0-inpainting-0.1 \\
-        --draft_ckpt /mnt/HDD_12TB/bam_ki/runs/sdxl_v1/draft_final.pt \\
-        --use_ema_draft \\
-        --data_root /mnt/HDD_12TB/bam_ki/datasets/coco2017/val2017 \\
-        --caption_json /mnt/HDD_12TB/bam_ki/datasets/coco2017/annotations/captions_val2017.json \\
-        --out_root /mnt/HDD_12TB/bam_ki/results/qualitative_coco_run \\
-        --num_images 12 --image_size 1024 \\
-        --target_steps 50 30 \\
-        --x0_thr_strict 0.02 --x0_thr_loose 0.07 \\
-        --x0_strict_center 0.45 --x0_strict_width 0.12 \\
-        --blend_temperature 0.10 \\
-        --mask_interior_weight 0.5 \\
-        --drift_k_switch_threshold 0.006 \\
-        --save_usage_maps
+        --draft_ckpt /mnt/HDD_12TB/bam_ki/runs/sdxl_v1/draft_step0290000.pt \\
+        --data_root /mnt/HDD_12TB/bam_ki/datasets/places2 \\
+        --out_root /mnt/HDD_12TB/bam_ki/results/baseline_sweep_places2 \\
+        --num_images 100 --image_size 1024 --guidance_scale 7.5 \\
+        --auto_prompt
 """
 import argparse
 import csv
@@ -52,7 +36,6 @@ import time
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F      # [PATCH 0] needed for usage_map upsample
 from PIL import Image
 from torchvision import transforms
 
@@ -68,6 +51,10 @@ from inference.speculative import fgsr_inpaint, baseline_inpaint
 # ====================================================================
 # Method definitions: the set of methods to compare on the same images
 # ====================================================================
+# Target-only at different step counts (reduced-step baselines).
+# FreqSpec at different tolerances (all at 50 steps).
+# NOTE: step counts for target baselines are chosen to bracket the FreqSpec
+# speedups; analyze_speed_matched.py finds the speed-matched pairs afterward.
 def build_method_list(args):
     methods = []
     # Reduced-step target baselines
@@ -110,8 +97,8 @@ def load_image(path, size):
 def make_mask(size, rng, p_box=0.4):
     """
     Generate a synthetic mask using the SAME distribution as training
-    (training.train.random_inpaint_mask): box (40퍼센트) or irregular brush
-    strokes (60퍼센트). Uses the provided rng for deterministic per-image masks.
+    (training.train.random_inpaint_mask): box (40%) or irregular brush
+    strokes (60%). Uses the provided rng for deterministic per-image masks.
 
     Returns 1x1xHxW float (1 = masked/inpaint region).
     """
@@ -249,38 +236,6 @@ def timed_run(fn, device):
 
 
 # ====================================================================
-# [PATCH 4] Combo 2 sanity print — show which fixes are active
-# ====================================================================
-def print_combo2_status(args):
-    def _flag(v):
-        return (f"on (val={v})"
-                if (v is not None and v != 0.0 and v != "")
-                else "off")
-    print("[sweep] FreqSpec fix configuration:")
-    print(f"  Fix 2  (fixed x0 gate)        : {_flag(args.x0_threshold)}")
-    print(f"  Fix 3  (soft blend)           : {_flag(args.blend_temperature)}")
-    print(f"  Fix 4  (timestep x0 strict)   : {_flag(args.x0_strict_center)} "
-          f"[strict={args.x0_thr_strict}, loose={args.x0_thr_loose}, "
-          f"width={args.x0_strict_width}]")
-    print(f"  Fix 4' (mask-interior)        : "
-          f"{_flag(args.mask_interior_weight)}")
-    print(f"  Fix 5  (drift-aware K-step)   : "
-          f"{_flag(args.drift_k_switch_threshold)} "
-          f"[k_switch_thr={args.k_switch_threshold}]")
-    all_combo2 = (
-        (args.x0_strict_center is not None)
-        and (args.blend_temperature is not None)
-        and (args.mask_interior_weight > 0)
-        and (args.drift_k_switch_threshold is not None)
-    )
-    label = "COMBO 2 (full)" if all_combo2 else "PARTIAL (not Combo 2)"
-    print(f"  >>> Active configuration: {label}")
-    if args.save_usage_maps:
-        print(f"  >>> --save_usage_maps ON: usage_map.png will be saved "
-              f"for each freqspec_* sample")
-
-
-# ====================================================================
 # Main
 # ====================================================================
 def main(args):
@@ -332,9 +287,6 @@ def main(args):
         json.dump(manifest, f, indent=2)
     print(f"[sweep] {len(manifest)} images x {len(methods)} methods")
     print(f"[sweep] methods: {[m['name'] for m in methods]}")
-
-    # [PATCH 4] Combo 2 sanity print
-    print_combo2_status(args)
 
     # Warmup (excluded from timing) — first image, target-only
     print("[sweep] warmup...")
@@ -467,8 +419,6 @@ def run_one(target, draft, sch, dwt, item, method, args, device):
                     x0_strict_center=args.x0_strict_center,
                     x0_strict_width=args.x0_strict_width,
                     drift_k_switch_threshold=args.drift_k_switch_threshold,
-                    # [PATCH 1] usage-map collection for qualitative figures
-                    return_usage_map=args.save_usage_maps,
                 ),
                 device,
             )
@@ -482,15 +432,6 @@ def run_one(target, draft, sch, dwt, item, method, args, device):
     save_rgb(img, os.path.join(m_out, "gt.png"))         # ground truth
     save_rgb(out, os.path.join(m_out, "out.png"))        # method output
     save_gray(mask_pix, os.path.join(m_out, "mask.png"))
-
-    # [PATCH 2] save draft usage map if present in stats
-    if "usage_map" in stats:
-        um = stats["usage_map"]  # [B,1,H_lat,W_lat] on CPU, values in [0,1]
-        um_up = F.interpolate(
-            um.to(device), size=(args.image_size, args.image_size),
-            mode="bilinear", align_corners=False,
-        )
-        save_gray(um_up, os.path.join(m_out, "usage_map.png"))
 
     return [item["idx"], item["image_path"], method["name"],
             method["num_steps"], round(t_run, 4), target_nfe, draft_nfe, accept]
@@ -529,20 +470,20 @@ def get_parser():
     p.add_argument("--beta", type=float, default=10.0)
     p.add_argument("--boundary_weight", type=float, default=1.0)
     p.add_argument("--mask_interior_weight", type=float, default=0.0,
-                   help="Fix 4 prime: penalize mask interior in saliency. "
-                        "0 disables. Try 0.3/0.5/0.8.")
+                   help="Fix #5: penalize mask interior in saliency. 0 "
+                        "disables. Try 0.3/0.5/0.8.")
     # --- Quick-fix knobs (forwarded to fgsr_inpaint) ---
     p.add_argument("--x0_threshold", type=float, default=None,
-                   help="Fix 2: pred_x0 disagreement gate. Per-patch "
+                   help="Fix #2: pred_x0 disagreement gate. Per-patch "
                         "MSE threshold between pred_x0_draft and "
                         "pred_x0_target. None disables the gate. "
                         "Suggested sweep: 0.01 / 0.02 / 0.05.")
     p.add_argument("--k_switch_threshold", type=float, default=0.6,
-                   help="Fix 1: rolling accept threshold above which "
+                   help="Fix #1: rolling accept threshold above which "
                         "spec-K (K>1) is used. Default 0.6 (original). "
                         "Raise to e.g. 0.75 to fall back to spec-1 sooner.")
     p.add_argument("--spec1_below_tnorm", type=float, default=0.0,
-                   help="Fix 1b: force spec-1 once t/T < this value. "
+                   help="Fix #1b: force spec-1 once t/T < this value. "
                         "0.0 disables. Try 0.4 to use spec-1 in the late "
                         "detail phase.")
     p.add_argument("--log_diagnostics", action="store_true",
@@ -550,32 +491,26 @@ def get_parser():
                         "accept_rate. Useful to find where trajectories "
                         "diverge.")
     p.add_argument("--blend_temperature", type=float, default=None,
-                   help="Fix 3: soft blend temperature. None disables "
+                   help="Fix #3: soft blend temperature. None disables "
                         "(original hard accept/reject). Suggested sweep: "
                         "0.05 (sharp) / 0.10 (medium) / 0.20 (soft).")
     p.add_argument("--x0_thr_strict", type=float, default=None,
-                   help="Fix 4: strict x0 threshold (used near "
+                   help="Fix #4: strict x0 threshold (used near "
                         "x0_strict_center). Suggested: 0.02 or 0.03.")
     p.add_argument("--x0_thr_loose", type=float, default=None,
-                   help="Fix 4: loose x0 threshold (used far from "
+                   help="Fix #4: loose x0 threshold (used far from "
                         "center). Suggested: 0.07 or 0.10.")
     p.add_argument("--x0_strict_center", type=float, default=None,
-                   help="Fix 4: t_norm peak of strictness. None "
+                   help="Fix #4: t_norm peak of strictness. None "
                         "disables timestep-dependent gate. Diagnostic "
                         "showed drift spikes near 0.45.")
     p.add_argument("--x0_strict_width", type=float, default=0.12,
-                   help="Fix 4: Gaussian width of the strictness peak. "
+                   help="Fix #4: Gaussian width of the strictness peak. "
                         "Default 0.12 covers t/T 0.33-0.57.")
     p.add_argument("--drift_k_switch_threshold", type=float, default=None,
-                   help="Fix 5: force spec-1 when x0_drift exceeds this. "
+                   help="Fix #6: force spec-1 when x0_drift exceeds this. "
                         "None disables. Try 0.004 / 0.006 / 0.008. "
-                        "Diagnostic showed peak drift around 0.009 at t/T=0.45.")
-    # [PATCH 3] new flag for usage-map saving
-    p.add_argument("--save_usage_maps", action="store_true",
-                   help="Save per-image draft usage maps (averaged "
-                        "soft-blend weight w(p)) as usage_map.png in each "
-                        "freqspec_* sample directory. Required for the "
-                        "qualitative figure assembly. Default off.")
+                        "Diagnostic showed peak drift ~0.009 at t/T=0.45.")
     return p
 
 
