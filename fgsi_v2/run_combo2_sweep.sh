@@ -76,7 +76,7 @@ python baseline_sweep.py \
     --data_root "${DATA_ROOT}" \
     ${CAPTION_ARG} ${PROMPT_ARG} \
     --out_root "${OUT_ROOT}" \
-    --num_images 12 \
+    --num_images 100 \
     --image_size 1024 \
     --target_steps 50 30 \
     \
