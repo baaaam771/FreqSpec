@@ -73,8 +73,10 @@ def make_masked_input(gt, mask, mode="gray"):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def find_mask_bbox(mask, min_size=128):
-    """Return (y0, y1, x0, x1) bounding box of the mask, padded to min_size."""
+def find_mask_bbox(mask, min_size=128, max_size_frac=0.30):
+    """Return (y0, y1, x0, x1) bounding box of the mask, padded to min_size
+    but capped at max_size_frac * min(H, W) so brush masks that span much
+    of the image still produce a reasonably zoomed crop."""
     H, W = mask.shape
     ys, xs = np.where(mask > 0.5)
     if len(ys) == 0:
@@ -84,10 +86,15 @@ def find_mask_bbox(mask, min_size=128):
     else:
         y0, y1 = ys.min(), ys.max()
         x0, x1 = xs.min(), xs.max()
-        # pad to make at least min_size square
+        # center on mask
         cy = (y0 + y1) // 2
         cx = (x0 + x1) // 2
+        # tight half size: just enough to contain mask, with small padding
         half = max((y1 - y0) // 2, (x1 - x0) // 2, min_size // 2) + 12
+        # cap at max_size_frac of the shorter image side so very spread-out
+        # brush masks don't produce a near-full-image "zoom"
+        max_half = int(min(H, W) * max_size_frac / 2)
+        half = min(half, max_half)
         y0 = max(0, cy - half)
         y1 = min(H, cy + half)
         x0 = max(0, cx - half)
@@ -95,9 +102,10 @@ def find_mask_bbox(mask, min_size=128):
     return int(y0), int(y1), int(x0), int(x1)
 
 
-def make_zoom(img, mask, size=256):
-    """Crop a zoom from the mask center, resized to (size, size)."""
-    y0, y1, x0, x1 = find_mask_bbox(mask, min_size=size)
+def make_zoom(img, mask, size=256, max_size_frac=0.30):
+    """Crop a zoom around the mask, resized to (size, size)."""
+    y0, y1, x0, x1 = find_mask_bbox(mask, min_size=size,
+                                    max_size_frac=max_size_frac)
     crop = img[y0:y1, x0:x1]
     crop_pil = Image.fromarray(crop)
     crop_pil = crop_pil.resize((size, size), Image.LANCZOS)
@@ -171,7 +179,7 @@ DATASET_TITLE = {"ffhq": "FFHQ", "places2": "Places2", "coco": "COCO"}
 
 COL_TITLES = [
     "Masked input",
-    "Mask",
+    "Original",
     "Target (50)",
     "Target (30)",
     "FreqSpec strict",
@@ -196,6 +204,11 @@ def main():
     p.add_argument("--mask_overlay", default="gray",
                    choices=["gray", "white", "checker"])
     p.add_argument("--zoom_size", type=int, default=320)
+    p.add_argument("--zoom_max_frac", type=float, default=0.30,
+                   help="Max bbox size as fraction of the shorter image "
+                        "side. Smaller -> tighter (more zoomed) crop. "
+                        "Default 0.30 (≈ image_size * 0.3). For brush "
+                        "masks try 0.20-0.25 for more dramatic zoom.")
     p.add_argument("--zoom_from", default="freqspec_default",
                    choices=["target_s50", "target_s30",
                             "freqspec_strict", "freqspec_default", "gt"])
@@ -268,15 +281,16 @@ def main():
     for r, sample in enumerate(rows):
         gt = sample["gt"]; mask = sample["mask"]
         masked_input = make_masked_input(gt, mask, mode=args.mask_overlay)
-        mask_rgb = (np.stack([mask] * 3, axis=-1) * 255).astype(np.uint8)
 
         # Choose zoom source
         zoom_src_img = sample.get(args.zoom_from, gt)
-        zoom_img, zoom_bbox = make_zoom(zoom_src_img, mask, size=args.zoom_size)
+        zoom_img, zoom_bbox = make_zoom(
+            zoom_src_img, mask, size=args.zoom_size,
+            max_size_frac=args.zoom_max_frac)
 
         panels = [
             ("masked",       masked_input),
-            ("mask",         mask_rgb),
+            ("origin",       gt),
             ("target_s50",   sample["target_s50"]),
             ("target_s30",   sample["target_s30"]),
             ("strict",       sample["freqspec_strict"]),
@@ -307,20 +321,11 @@ def main():
 
     plt.subplots_adjust(wspace=0.03, hspace=0.05)
 
-    # Add usage colorbar at bottom-right if any sample has a usage map
-    has_usage = any(s.get("usage") is not None for s in rows)
-    if has_usage:
-        # legend strip placed outside the grid via figure-level text
-        cax = fig.add_axes([0.91, 0.13, 0.012, 0.20])
-        cb_data = np.linspace(0, 1, 256).reshape(-1, 1)
-        cax.imshow(cb_data, aspect="auto", cmap="viridis",
-                   extent=[0, 1, 0, 1], origin="lower")
-        cax.set_xticks([])
-        cax.set_yticks([0, 1])
-        cax.set_yticklabels(["target", "draft"], fontsize=8)
-        cax.set_title("$w(p)$", fontsize=9)
-
     out = args.out_path
+    # Auto-create output directory if it doesn't exist
+    out_dir = os.path.dirname(out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     if not out.endswith((".pdf", ".png")):
         plt.savefig(out + ".pdf", bbox_inches="tight", dpi=args.dpi)
         plt.savefig(out + ".png", bbox_inches="tight", dpi=args.dpi)
