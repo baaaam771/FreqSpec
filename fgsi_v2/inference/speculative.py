@@ -19,7 +19,7 @@ import math
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from models.wavelet import DWT2D, combined_saliency
+from models.wavelet import DWT2D, combined_saliency, lwd_wavelet_saliency
 from training.scheduler import DDPMSchedule
 
 
@@ -132,7 +132,8 @@ def fgsr_inpaint(
     # === NEW: per-patch verifier-log accumulator (Table A) ===
     if collect_patch_logs:
         log_chunks = {
-            "d_x0": [], "s_eps": [], "w": [], "saliency": [], "t_norm": [],
+            "d_x0": [], "s_eps": [], "w": [], "saliency": [],
+            "wav": [], "t_norm": [],
         }
 
     i = 0
@@ -249,6 +250,12 @@ def fgsr_inpaint(
                 w_log = w_log * torch.sigmoid(
                     (x0_thr_effective - x0_delta_patch) / max(bt, 1e-6))
             sel = mask_patch_bool.bool().view(-1)
+            # pure-wavelet A_wav (LWD high-freq energy only), patch-pooled,
+            # so Table A can carry a genuine "Wavelet only (A_wav)" column that
+            # is independent of boundary/interior. This is the honest standalone
+            # frequency signal; the combined saliency above is A.
+            a_wav = lwd_wavelet_saliency(z, dwt, target_size=(H, W))
+            a_wav_patch = F.avg_pool2d(a_wav, patch_size, stride=patch_size)
             log_chunks["d_x0"].append(
                 x0_delta_patch.detach().float().view(-1)[sel].cpu())
             log_chunks["s_eps"].append(
@@ -257,6 +264,8 @@ def fgsr_inpaint(
                 w_log.detach().float().view(-1)[sel].cpu())
             log_chunks["saliency"].append(
                 sal_patch.detach().float().view(-1)[sel].cpu())
+            log_chunks["wav"].append(
+                a_wav_patch.detach().float().view(-1)[sel].cpu())
             n_sel = int(sel.sum().item())
             log_chunks["t_norm"].append(
                 torch.full((n_sel,), float(t_norm), dtype=torch.float32))

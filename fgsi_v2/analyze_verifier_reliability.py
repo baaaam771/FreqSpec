@@ -65,6 +65,9 @@ def load_logs(logs_dir):
                for k in ("d_x0", "s_eps", "w", "saliency", "t_norm")}
         if rec["d_x0"].size == 0:
             continue
+        # optional pure-wavelet component (only if logged separately)
+        if "wav" in logs and np.asarray(logs["wav"]).size == rec["d_x0"].size:
+            rec["wav"] = np.asarray(logs["wav"], dtype=np.float64)
         rec["image_id"] = d.get("image_id", os.path.basename(p))
         rec["seed"] = d.get("seed", -1)
         items.append(rec)
@@ -76,7 +79,10 @@ def load_logs(logs_dir):
 
 
 def merge(items, keys=("d_x0", "s_eps", "w", "saliency", "t_norm")):
-    return {k: np.concatenate([r[k] for r in items], axis=0) for k in keys}
+    out = {k: np.concatenate([r[k] for r in items], axis=0) for k in keys}
+    if all("wav" in r for r in items):
+        out["wav"] = np.concatenate([r["wav"] for r in items], axis=0)
+    return out
 
 
 # ====================================================================
@@ -84,17 +90,41 @@ def merge(items, keys=("d_x0", "s_eps", "w", "saliency", "t_norm")):
 # ====================================================================
 def build_selectors(merged, rng):
     """Return {name: confidence_array}. Risk is d_x0, so a perfect selector
-    ranks by -d_x0 (oracle). The honest deployable baselines are wavelet and
-    epsilon; full is the proposed rule; x0-gate is near-oracle (uses target)."""
+    ranks by -d_x0 (oracle). The honest deployable baselines are the saliency
+    prior and epsilon agreement; full is the proposed rule.
+
+    NOTE on labels:
+      "Saliency (1-A)" is 1 - the *combined* saliency A that was logged at run
+      time (A = wavelet + boundary + interior under Combo 2). It is NOT a pure
+      wavelet signal, so it must not be used to justify the "frequency-guided"
+      claim -- that comparison belongs in Table B. A genuine wavelet-only
+      column appears automatically only if the logs carry a separate "wav"
+      (pure A_wav) field; see verifier_reliability_sweep.py --log_components.
+
+      The x0-gate uses the target's own x0, so ranking by -d_x0 is identical to
+      the oracle on this risk metric. We therefore report a single
+      "Oracle (x0 upper bound)" row instead of two identical lines.
+    """
     err = merged["d_x0"]
-    return {
-        "Random":            rng.random(err.shape),
-        "Wavelet only":      1.0 - merged["saliency"],
-        "Epsilon agreement": merged["s_eps"],
-        "x0-gate only":      -err,            # uses target -> near oracle
-        "Full FreqSpec":     merged["w"],
-        "Oracle":            -err,
+    sel = {
+        "Random":                  rng.random(err.shape),
+        "Saliency (1-A)":          1.0 - merged["saliency"],
+        "Epsilon agreement":       merged["s_eps"],
+        "Full FreqSpec":           merged["w"],
+        "Oracle (x0 upper bound)": -err,
     }
+    # genuine pure-wavelet column, only when separately logged
+    if "wav" in merged and np.asarray(merged["wav"]).size:
+        ordered = {
+            "Random": sel["Random"],
+            "Wavelet only (A_wav)": 1.0 - np.asarray(merged["wav"]),
+            "Saliency (1-A)": sel["Saliency (1-A)"],
+            "Epsilon agreement": sel["Epsilon agreement"],
+            "Full FreqSpec": sel["Full FreqSpec"],
+            "Oracle (x0 upper bound)": sel["Oracle (x0 upper bound)"],
+        }
+        return ordered
+    return sel
 
 
 # ====================================================================
@@ -203,11 +233,13 @@ def _confidence_for(rec, name, rng):
     err = rec["d_x0"]
     if name == "Random":
         return rng.random(err.shape)
-    if name == "Wavelet only":
+    if name == "Wavelet only (A_wav)":
+        return 1.0 - np.asarray(rec["wav"])
+    if name == "Saliency (1-A)":
         return 1.0 - rec["saliency"]
     if name == "Epsilon agreement":
         return rec["s_eps"]
-    if name in ("x0-gate only", "Oracle"):
+    if name == "Oracle (x0 upper bound)":
         return -err
     if name == "Full FreqSpec":
         return rec["w"]
@@ -266,8 +298,7 @@ def main(args):
             st = coverage_matched_stats(conf, merged["d_x0"], cov,
                                         args.bad_quantile)
             macro_mean, (lo, hi) = macro_bootstrap(
-                items, name if name != "Oracle" else "x0-gate only",
-                cov, args.bad_quantile, args.bootstrap, rng)
+                items, name, cov, args.bad_quantile, args.bootstrap, rng)
             rows.append({
                 "selector": name, "coverage": cov,
                 "accepted_error_micro": st["accepted_error"],
@@ -306,8 +337,11 @@ def main(args):
             if rmask.sum() == 0:
                 continue
             err_r = merged["d_x0"][rmask]
-            for sname in ("Random", "Wavelet only", "Epsilon agreement",
-                          "Full FreqSpec", "Oracle"):
+            region_selectors = [s for s in (
+                "Random", "Wavelet only (A_wav)", "Saliency (1-A)",
+                "Epsilon agreement", "Full FreqSpec",
+                "Oracle (x0 upper bound)") if s in selectors]
+            for sname in region_selectors:
                 conf_r = selectors[sname][rmask]
                 st = coverage_matched_stats(conf_r, err_r, 0.50,
                                             args.bad_quantile)
@@ -336,11 +370,17 @@ def _write_latex(rows, cov_points, selectors, aurc, path):
     lines = [
         r"\begin{table}[t]\centering",
         r"\caption{Reliability of patch-level draft verification (COCO). "
-        r"Accepted/rejected error are coverage-matched predicted-$\hat{x}_0$ "
-        r"disagreement; lower accepted error and higher error ratio indicate "
-        r"a better verifier. FAR is the fraction of accepted patches in the "
-        r"top-20\% error tail. AURC integrates risk over coverage "
-        r"$[0.05,1.0]$.}",
+        r"Risk is the coverage-matched predicted-$\hat{x}_0$ disagreement of "
+        r"accepted patches; lower accepted error, higher error ratio, and "
+        r"lower false-accept rate (FAR, fraction of accepted patches in the "
+        r"top-20\% error tail) indicate a better verifier. AURC integrates "
+        r"risk over coverage $[0.05,1.0]$. ``Saliency $(1{-}A)$'' uses the "
+        r"combined frequency-and-boundary saliency as a standalone selector; "
+        r"its near-random AURC shows that saliency is a strictness prior, not "
+        r"a direct disagreement predictor. ``Oracle ($\hat{x}_0$ upper "
+        r"bound)'' ranks by true $\hat{x}_0$ disagreement and equals an "
+        r"$\hat{x}_0$-gate oracle on this metric. Full FreqSpec combines "
+        r"agreement and $\hat{x}_0$ tests and approaches the oracle.}",
         r"\label{tab:verifier_reliability}",
         r"\small",
         r"\begin{tabular}{l c c c c c c}",
@@ -350,10 +390,11 @@ def _write_latex(rows, cov_points, selectors, aurc, path):
         r"\midrule",
     ]
     for name in selectors:
+        tex_name = name.replace("_", r"\_")
         for cov in cov_points:
             r = by[(name, cov)]
             lines.append(
-                f"{name} & {int(cov*100)}\\% & "
+                f"{tex_name} & {int(cov*100)}\\% & "
                 f"{r['accepted_error_micro']:.4f} & "
                 f"{r['rejected_error_micro']:.4f} & "
                 f"{r['error_ratio']:.2f} & "
