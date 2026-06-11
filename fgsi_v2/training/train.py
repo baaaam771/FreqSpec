@@ -250,6 +250,14 @@ def train(args):
         gamma_main=args.gamma_main,
         lambda_uniform=args.lambda_uniform,
         device=device,
+        # training-objective ablation (Table C)
+        use_distill=not args.no_distill,
+        distill_global=args.distill_global,
+        use_hard_gt=not args.no_hard_gt,
+        use_uniform_gt=not args.no_uniform_gt,
+        mask_signal=args.mask_signal,
+        mask_use_base=not args.mask_no_base,
+        static_mask=args.static_mask,
     )
 
     # ---- data ----
@@ -494,6 +502,26 @@ def get_parser():
     p.add_argument("--alpha_distill", type=float, default=0.5)
     p.add_argument("--gamma_main", type=float, default=2.0)
     p.add_argument("--lambda_uniform", type=float, default=1.0)
+    # === training-objective ablation flags (Table C) ===
+    p.add_argument("--no_distill", action="store_true",
+                   help="Drop the easy-region target distillation term.")
+    p.add_argument("--distill_global", action="store_true",
+                   help="Apply distillation everywhere, not just easy regions "
+                        "(Table C: 'global target distillation only').")
+    p.add_argument("--no_hard_gt", action="store_true",
+                   help="Drop the hard-region ground-truth term.")
+    p.add_argument("--no_uniform_gt", action="store_true",
+                   help="Drop the uniform safety ground-truth term.")
+    p.add_argument("--mask_signal", type=str, default="wavelet",
+                   choices=["wavelet", "sobel", "laplacian", "variance",
+                            "random", "uniform"],
+                   help="Base signal for the time-dependent supervision mask M_t.")
+    p.add_argument("--mask_no_base", action="store_true",
+                   help="Use mask geometry only for M_t (no wavelet/base signal) "
+                        "(Table C: 'Full without wavelet M_t').")
+    p.add_argument("--static_mask", action="store_true",
+                   help="Use a timestep-independent hard/easy split "
+                        "(Table C: 'Full with static M').")
     # CFG training
     p.add_argument("--train_with_cfg", action="store_true",
                    help="학습 시 target에 CFG 적용. 학습 비용 2배. "

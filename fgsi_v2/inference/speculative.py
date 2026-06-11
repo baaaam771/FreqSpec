@@ -54,6 +54,13 @@ def fgsr_inpaint(
     boundary_weight: float = 1.0,
     mask_interior_weight: float = 0.0,
     uniform_saliency: bool = False,
+    # === NEW: saliency-ablation controls (Table B) ===
+    # saliency_signal selects the BASE signal: "wavelet" (paper default),
+    # "sobel", "laplacian", "variance", "random", "uniform".
+    # saliency_use_base=False zeros the base map so boundary/interior-only
+    # configurations can be isolated.
+    saliency_signal: str = "wavelet",
+    saliency_use_base: bool = True,
     dwt=None,
     verbose: bool = False,
     guidance_scale: float = 1.0,
@@ -75,6 +82,15 @@ def fgsr_inpaint(
     # When True, the time-averaged soft-blend weight (or hard accept indicator)
     # over Phase-2 verified timesteps is returned in stats["usage_map"].
     return_usage_map: bool = False,
+    # === NEW: per-patch verifier logging (Table A / risk-coverage) ===
+    # When True, at every Phase-2 *verified* timestep (block head, where both
+    # target and draft were evaluated), the per-mask-interior-patch quantities
+    #   d_x0(p), s_eps(p), w(p), A(p), t_norm
+    # are collected and returned (flattened, concatenated over all verified
+    # timesteps) in stats["patch_logs"] as a dict of 1-D CPU tensors.
+    # Draft-only lookahead steps are NOT logged (no target prediction there),
+    # which is exactly the convention required for risk-coverage analysis.
+    collect_patch_logs: bool = False,
 ):
     """
     Returns:
@@ -113,6 +129,12 @@ def fgsr_inpaint(
         usage_acc = torch.zeros(B, 1, H, W, device=device)
         usage_count = 0
 
+    # === NEW: per-patch verifier-log accumulator (Table A) ===
+    if collect_patch_logs:
+        log_chunks = {
+            "d_x0": [], "s_eps": [], "w": [], "saliency": [], "t_norm": [],
+        }
+
     i = 0
     while i < N:
         t_cur = int(ts[i].item())
@@ -143,7 +165,9 @@ def fgsr_inpaint(
                                 boundary_weight=boundary_weight,
                                 interior_weight=mask_interior_weight,
                                 target_size=(H, W),
-                                uniform=uniform_saliency)
+                                uniform=uniform_saliency,
+                                signal=saliency_signal,
+                                use_base_signal=saliency_use_base)
         sal_patch = F.avg_pool2d(sal, patch_size, stride=patch_size)
         tol_patch = tol_low + (tol_high - tol_low) * (1 - sal_patch)
 
@@ -211,6 +235,32 @@ def fgsr_inpaint(
                 usage_acc = usage_acc + accept_full.detach()
                 usage_count = usage_count + 1
 
+        # === NEW: per-patch verifier logging at this verified timestep ===
+        # Collect only mask-interior patches (M(p)=1) so the analysis is
+        # restricted to the patches the system is actually allowed to draft.
+        # We always compute a patch-level blend weight w_log here (independent
+        # of the active blend mode) so logs are uniform across configs.
+        if collect_patch_logs:
+            margin_log = a_patch - (1.0 - tol_patch)
+            bt = blend_temperature if (blend_temperature is not None
+                                       and blend_temperature > 0) else 0.10
+            w_log = torch.sigmoid(margin_log / bt)
+            if x0_thr_effective is not None:
+                w_log = w_log * torch.sigmoid(
+                    (x0_thr_effective - x0_delta_patch) / max(bt, 1e-6))
+            sel = mask_patch_bool.bool().view(-1)
+            log_chunks["d_x0"].append(
+                x0_delta_patch.detach().float().view(-1)[sel].cpu())
+            log_chunks["s_eps"].append(
+                a_patch.detach().float().view(-1)[sel].cpu())
+            log_chunks["w"].append(
+                w_log.detach().float().view(-1)[sel].cpu())
+            log_chunks["saliency"].append(
+                sal_patch.detach().float().view(-1)[sel].cpu())
+            n_sel = int(sel.sum().item())
+            log_chunks["t_norm"].append(
+                torch.full((n_sel,), float(t_norm), dtype=torch.float32))
+
         z_next, _ = scheduler.ddim_step(z, eps_mix, t_cur, t_prev)
         z_next = _blend(z_next, t_prev)
 
@@ -274,6 +324,17 @@ def fgsr_inpaint(
             usage_map = torch.zeros(B, 1, H, W, device=device)
         stats["usage_map"] = usage_map.cpu()
         stats["usage_count"] = usage_count
+
+    # === NEW: append per-patch verifier logs to stats ===
+    if collect_patch_logs:
+        if len(log_chunks["d_x0"]) > 0:
+            stats["patch_logs"] = {
+                k: torch.cat(v, dim=0) for k, v in log_chunks.items()
+            }
+        else:
+            stats["patch_logs"] = {
+                k: torch.zeros(0, dtype=torch.float32) for k in log_chunks
+            }
 
     return z, stats
 

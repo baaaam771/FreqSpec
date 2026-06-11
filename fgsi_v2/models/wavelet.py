@@ -89,9 +89,97 @@ def boundary_indicator(mask, kernel=5):
     return (dil - ero).clamp(0, 1)
 
 
+def _minmax_per_image(x, eps=1e-6):
+    B = x.shape[0]
+    flat = x.view(B, -1)
+    mn = flat.min(dim=1, keepdim=True)[0]
+    mx = flat.max(dim=1, keepdim=True)[0]
+    return ((flat - mn) / (mx - mn + eps)).view_as(x)
+
+
+def _sobel_saliency(latent, target_size, eps=1e-6):
+    """Spatial-gradient saliency baseline (Sobel magnitude over channels)."""
+    C = latent.shape[1]
+    kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
+                      device=latent.device, dtype=latent.dtype)
+    ky = kx.t().contiguous()
+    kx = kx.view(1, 1, 3, 3).repeat(C, 1, 1, 1)
+    ky = ky.view(1, 1, 3, 3).repeat(C, 1, 1, 1)
+    xp = F.pad(latent, (1, 1, 1, 1), mode="reflect")
+    gx = F.conv2d(xp, kx, groups=C)
+    gy = F.conv2d(xp, ky, groups=C)
+    mag = (gx.pow(2) + gy.pow(2)).mean(dim=1, keepdim=True).sqrt()
+    H_out, W_out = target_size or latent.shape[-2:]
+    mag = F.interpolate(mag, size=(H_out, W_out), mode="bilinear",
+                        align_corners=False)
+    return _minmax_per_image(mag, eps)
+
+
+def _laplacian_saliency(latent, target_size, eps=1e-6):
+    """Laplacian energy saliency baseline."""
+    C = latent.shape[1]
+    k = torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]],
+                     device=latent.device, dtype=latent.dtype)
+    k = k.view(1, 1, 3, 3).repeat(C, 1, 1, 1)
+    xp = F.pad(latent, (1, 1, 1, 1), mode="reflect")
+    lap = F.conv2d(xp, k, groups=C).pow(2).mean(dim=1, keepdim=True)
+    H_out, W_out = target_size or latent.shape[-2:]
+    lap = F.interpolate(lap, size=(H_out, W_out), mode="bilinear",
+                        align_corners=False)
+    return _minmax_per_image(lap, eps)
+
+
+def _variance_saliency(latent, target_size, win=3, eps=1e-6):
+    """Local latent-variance saliency baseline (per-window variance)."""
+    x = latent.mean(dim=1, keepdim=True)
+    pad = win // 2
+    mean = F.avg_pool2d(F.pad(x, (pad,)*4, mode="reflect"), win, stride=1)
+    mean2 = F.avg_pool2d(F.pad(x.pow(2), (pad,)*4, mode="reflect"), win, stride=1)
+    var = (mean2 - mean.pow(2)).clamp_min(0.0)
+    H_out, W_out = target_size or latent.shape[-2:]
+    var = F.interpolate(var, size=(H_out, W_out), mode="bilinear",
+                        align_corners=False)
+    return _minmax_per_image(var, eps)
+
+
+def base_saliency_signal(latent, dwt, signal="wavelet", target_size=None,
+                         eps=1e-6, generator=None):
+    """Return a base (pre-boundary, pre-interior) saliency map in [0,1].
+
+    signal:
+        "wavelet"   - LWD Haar high-frequency energy (paper default)
+        "sobel"     - Sobel gradient magnitude
+        "laplacian" - Laplacian energy
+        "variance"  - local latent variance
+        "random"    - uniform random map (control)
+        "uniform"   - constant 1.0 (no saliency)
+    These are the Table B comparison signals: a frequency-guided method must
+    beat sobel / laplacian / variance to justify the wavelet choice.
+    """
+    H_out, W_out = target_size or latent.shape[-2:]
+    if signal == "wavelet":
+        return lwd_wavelet_saliency(latent, dwt, target_size=(H_out, W_out), eps=eps)
+    if signal == "sobel":
+        return _sobel_saliency(latent, (H_out, W_out), eps)
+    if signal == "laplacian":
+        return _laplacian_saliency(latent, (H_out, W_out), eps)
+    if signal == "variance":
+        return _variance_saliency(latent, (H_out, W_out), eps=eps)
+    if signal == "random":
+        r = torch.rand(latent.shape[0], 1, H_out, W_out,
+                       device=latent.device, dtype=latent.dtype,
+                       generator=generator)
+        return r
+    if signal in ("uniform", "none"):
+        return torch.ones(latent.shape[0], 1, H_out, W_out,
+                          device=latent.device, dtype=latent.dtype)
+    raise ValueError(f"unknown saliency signal: {signal}")
+
+
 def combined_saliency(latent, mask, dwt, boundary_weight=1.0,
                      boundary_kernel=5, target_size=None, eps=1e-6,
-                     uniform=False, interior_weight=0.0):
+                     uniform=False, interior_weight=0.0,
+                     signal="wavelet", use_base_signal=True):
     """A_combined for inpainting: A_wavelet + λ_b · Boundary + λ_m · Interior.
     
     Args:
@@ -110,8 +198,13 @@ def combined_saliency(latent, mask, dwt, boundary_weight=1.0,
         # Uniform: saliency = 1 everywhere. Wavelet 계산 skip.
         A_w = torch.ones(latent.shape[0], 1, H_out, W_out,
                          device=latent.device, dtype=latent.dtype)
+    elif not use_base_signal:
+        # Boundary-only / interior-only configs: zero base, components added below.
+        A_w = torch.zeros(latent.shape[0], 1, H_out, W_out,
+                          device=latent.device, dtype=latent.dtype)
     else:
-        A_w = lwd_wavelet_saliency(latent, dwt, target_size=(H_out, W_out), eps=eps)
+        A_w = base_saliency_signal(latent, dwt, signal=signal,
+                                   target_size=(H_out, W_out), eps=eps)
     if mask.shape[-2:] != (H_out, W_out):
         mask_r = F.interpolate(mask, size=(H_out, W_out), mode="nearest")
     else:
