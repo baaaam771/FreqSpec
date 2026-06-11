@@ -110,7 +110,7 @@ def run_one(target, draft, sch, dwt, item, cfg, args, device):
             device,
         )
     # outputs for the existing LPIPS / boundary-LPIPS tooling
-    m_out = os.path.join(args.out_root, name, f"img_{item['idx']:04d}")
+    m_out = os.path.join(args.out_root, name, f"img_{item['idx']:03d}")
     os.makedirs(m_out, exist_ok=True)
     out = target.decode_latent(z_out)
     out = img * (1 - mask_pix) + out * mask_pix
@@ -124,7 +124,7 @@ def run_one(target, draft, sch, dwt, item, cfg, args, device):
     torch.save({"patch_logs": pl,
                 "image_id": os.path.basename(item["image_path"]),
                 "seed": item["seed"]},
-               os.path.join(logs_dir, f"img_{item['idx']:04d}.pt"))
+               os.path.join(logs_dir, f"img_{item['idx']:03d}.pt"))
     n_logged = int(pl["d_x0"].numel()) if "d_x0" in pl else 0
     return [item["idx"], name, round(t_run, 4), stats["target_calls"],
             stats["draft_calls"], f"{stats['accept_rate']:.4f}", n_logged]
