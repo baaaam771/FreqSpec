@@ -1,248 +1,138 @@
 """
-Wavelet 변환 + LWD-style frequency saliency + boundary-aware extension.
+Draft 모델 학습 loss.
 
-LWD (Sigillo et al. 2025): 
-    E(i,j) = (1/C) Σ_c [(z_LH)^2 + (z_HL)^2 + (z_HH)^2]
-    A_wavelet ∈ [0,1]^{H×W} (min-max normalized)
-    M_t(i,j) = 1 if (A(i,j) + ℓ) ≥ t
+설계 의도:
+- 평탄 영역 (1 - M_t): target eps를 모방 (distillation) → 추론 시 accept rate ↑
+- 어려운 영역 (M_t): GT eps를 직접 학습 → 가끔 reject되어도 합리적
+- M_t는 LWD-style time-dependent binary mask (boundary-aware)
 
-Ours (boundary extension for inpainting):
-    A_combined = normalize(A_wavelet + λ_b · BoundaryIndicator(mask))
+L_draft = (1 - M_t) ⊙ α_distill ||ε_draft - ε_target||²        # 평탄: target 모방
+        + M_t ⊙ γ_main      ||ε_draft - ε_gt    ||²            # 어려운: GT 학습
+        + λ_uniform         ||ε_draft - ε_gt    ||²            # 안전망: 전 영역 약한 학습
+
+α_distill, γ_main, λ_uniform은 hyperparameter.
+실용적으로는 평탄 영역에서 distillation을 가장 강하게.
 """
-import math
+import os
+import sys
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-_WAVELET_COEFFS = {
-    "haar": {
-        "dec_lo": [1 / math.sqrt(2), 1 / math.sqrt(2)],
-        "dec_hi": [-1 / math.sqrt(2), 1 / math.sqrt(2)],
-    },
-    "db2": {
-        "dec_lo": [-0.12940952255092145, 0.22414386804185735,
-                   0.836516303737469, 0.48296291314469025],
-        "dec_hi": [-0.48296291314469025, 0.836516303737469,
-                   -0.22414386804185735, -0.12940952255092145],
-    },
-}
+from models.wavelet import DWT2D, combined_saliency, lwd_time_mask
 
 
-def _get_dec_filters(wavelet: str):
-    try:
-        import pywt
-        w = pywt.Wavelet(wavelet)
-        return list(w.dec_lo), list(w.dec_hi)
-    except ImportError:
-        if wavelet not in _WAVELET_COEFFS:
-            raise ValueError(f"Need pywt for {wavelet}. Built-in: {list(_WAVELET_COEFFS.keys())}")
-        c = _WAVELET_COEFFS[wavelet]
-        return c["dec_lo"], c["dec_hi"]
+class DraftLoss:
+    def __init__(
+        self,
+        wavelet: str = "haar",
+        boundary_weight: float = 1.0,
+        boundary_kernel: int = 5,
+        ell: float = 0.3,
+        alpha_distill: float = 1.0,   # 평탄 영역에서 target 모방 강도
+        gamma_main: float = 1.0,      # 어려운 영역에서 GT 학습 강도
+        lambda_uniform: float = 0.1,  # 전 영역 안전망
+        device: str = "cpu",
+        # === NEW: training-objective ablation flags (Table C) ===
+        # All default to the paper's full region-aware objective; flipping a
+        # flag isolates one design choice. Defaults reproduce prior behavior.
+        use_distill: bool = True,     # easy-region target distillation term
+        distill_global: bool = False, # apply distill everywhere (not just easy)
+        use_hard_gt: bool = True,     # hard-region ground-truth term
+        use_uniform_gt: bool = True,  # uniform safety ground-truth term
+        mask_signal: str = "wavelet", # base signal for M_t: wavelet/sobel/.../mask
+        mask_use_base: bool = True,   # False -> mask geometry only (no wavelet)
+        static_mask: bool = False,    # True -> timestep-independent M (fixed thr)
+        static_threshold: float = 0.5,
+    ):
+        self.dwt = DWT2D(wavelet).to(device)
+        self.boundary_weight = boundary_weight
+        self.boundary_kernel = boundary_kernel
+        self.ell = ell
+        self.alpha_distill = alpha_distill
+        self.gamma_main = gamma_main
+        self.lambda_uniform = lambda_uniform
+        self.use_distill = use_distill
+        self.distill_global = distill_global
+        self.use_hard_gt = use_hard_gt
+        self.use_uniform_gt = use_uniform_gt
+        self.mask_signal = mask_signal
+        self.mask_use_base = mask_use_base
+        self.static_mask = static_mask
+        self.static_threshold = static_threshold
 
+    def to(self, device):
+        self.dwt = self.dwt.to(device)
+        return self
 
-class DWT2D(nn.Module):
-    """LL, LH, HL, HH decomposition."""
-    def __init__(self, wavelet: str = "haar"):
-        super().__init__()
-        dec_lo_l, dec_hi_l = _get_dec_filters(wavelet)
-        dec_lo = torch.tensor(dec_lo_l[::-1], dtype=torch.float32)
-        dec_hi = torch.tensor(dec_hi_l[::-1], dtype=torch.float32)
-        ll = torch.outer(dec_lo, dec_lo)
-        lh = torch.outer(dec_hi, dec_lo)
-        hl = torch.outer(dec_lo, dec_hi)
-        hh = torch.outer(dec_hi, dec_hi)
-        filters = torch.stack([ll, lh, hl, hh], dim=0).unsqueeze(1)
-        self.register_buffer("filters", filters)
-        self.k = filters.shape[-1]
+    @torch.no_grad()
+    def compute_mask(self, z0, mask_z, t_normalized):
+        """Compute A_combined and binary M_t."""
+        sal = combined_saliency(
+            z0, mask_z, self.dwt,
+            boundary_weight=self.boundary_weight,
+            boundary_kernel=self.boundary_kernel,
+            target_size=z0.shape[-2:],
+            signal=self.mask_signal,
+            use_base_signal=self.mask_use_base,
+        )
+        if self.static_mask:
+            # timestep-independent hard/easy split (Table C: "Full with static M")
+            M_t = (sal >= self.static_threshold).float()
+        else:
+            M_t = lwd_time_mask(sal, t_normalized, ell=self.ell)
+        return M_t, sal
 
-    def forward(self, x: torch.Tensor):
-        # dtype auto-cast: filter를 input dtype에 맞춰서 fp16 학습 호환
-        B, C, H, W = x.shape
-        f = self.filters.repeat(C, 1, 1, 1)
-        if f.dtype != x.dtype:
-            f = f.to(x.dtype)
-        pad = self.k // 2
-        x_p = F.pad(x, (pad, pad, pad, pad), mode="reflect")
-        y = F.conv2d(x_p, f, stride=2, groups=C)
-        y = y.view(B, C, 4, y.shape[-2], y.shape[-1])
-        return y[:, :, 0], y[:, :, 1], y[:, :, 2], y[:, :, 3]
+    def __call__(
+        self,
+        eps_draft: torch.Tensor,      # [B,4,Hl,Wl]
+        eps_target: torch.Tensor,     # [B,4,Hl,Wl] (no grad)
+        eps_gt: torch.Tensor,         # [B,4,Hl,Wl]
+        z0: torch.Tensor,             # [B,4,Hl,Wl]
+        mask_z: torch.Tensor,         # [B,1,Hl,Wl]
+        t_normalized: torch.Tensor,   # [B] in [0,1]
+    ):
+        M_t, sal = self.compute_mask(z0, mask_z, t_normalized)  # [B,1,H,W]
 
+        # 각 위치별 squared error (channel mean)
+        err_distill = (eps_draft - eps_target.detach()).pow(2).mean(dim=1, keepdim=True)
+        err_main = (eps_draft - eps_gt).pow(2).mean(dim=1, keepdim=True)
 
-def lwd_wavelet_saliency(latent, dwt, target_size=None, eps=1e-6):
-    """LWD Eq.3."""
-    _, lh, hl, hh = dwt(latent)
-    E = (lh.pow(2) + hl.pow(2) + hh.pow(2)).mean(dim=1, keepdim=True)
-    H_out, W_out = target_size or latent.shape[-2:]
-    E_up = F.interpolate(E, size=(H_out, W_out), mode="bilinear", align_corners=False)
-    B = E_up.shape[0]
-    flat = E_up.view(B, -1)
-    mn = flat.min(dim=1, keepdim=True)[0]
-    mx = flat.max(dim=1, keepdim=True)[0]
-    return ((flat - mn) / (mx - mn + eps)).view(B, 1, H_out, W_out)
+        # easy-region (or global) target distillation
+        if self.use_distill:
+            distill_weight = 1.0 if self.distill_global else (1 - M_t)
+            l_distill = (self.alpha_distill * distill_weight * err_distill).mean()
+        else:
+            l_distill = err_distill.new_zeros(())
+        # hard-region ground-truth
+        if self.use_hard_gt:
+            l_main = (self.gamma_main * M_t * err_main).mean()
+        else:
+            l_main = err_main.new_zeros(())
+        # uniform safety ground-truth
+        if self.use_uniform_gt:
+            l_uniform = self.lambda_uniform * err_main.mean()
+        else:
+            l_uniform = err_main.new_zeros(())
 
-
-def boundary_indicator(mask, kernel=5):
-    pad = kernel // 2
-    dil = F.max_pool2d(mask, kernel, stride=1, padding=pad)
-    ero = -F.max_pool2d(-mask, kernel, stride=1, padding=pad)
-    return (dil - ero).clamp(0, 1)
-
-
-def _minmax_per_image(x, eps=1e-6):
-    B = x.shape[0]
-    flat = x.view(B, -1)
-    mn = flat.min(dim=1, keepdim=True)[0]
-    mx = flat.max(dim=1, keepdim=True)[0]
-    return ((flat - mn) / (mx - mn + eps)).view_as(x)
-
-
-def _sobel_saliency(latent, target_size, eps=1e-6):
-    """Spatial-gradient saliency baseline (Sobel magnitude over channels)."""
-    C = latent.shape[1]
-    kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
-                      device=latent.device, dtype=latent.dtype)
-    ky = kx.t().contiguous()
-    kx = kx.view(1, 1, 3, 3).repeat(C, 1, 1, 1)
-    ky = ky.view(1, 1, 3, 3).repeat(C, 1, 1, 1)
-    xp = F.pad(latent, (1, 1, 1, 1), mode="reflect")
-    gx = F.conv2d(xp, kx, groups=C)
-    gy = F.conv2d(xp, ky, groups=C)
-    mag = (gx.pow(2) + gy.pow(2)).mean(dim=1, keepdim=True).sqrt()
-    H_out, W_out = target_size or latent.shape[-2:]
-    mag = F.interpolate(mag, size=(H_out, W_out), mode="bilinear",
-                        align_corners=False)
-    return _minmax_per_image(mag, eps)
-
-
-def _laplacian_saliency(latent, target_size, eps=1e-6):
-    """Laplacian energy saliency baseline."""
-    C = latent.shape[1]
-    k = torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]],
-                     device=latent.device, dtype=latent.dtype)
-    k = k.view(1, 1, 3, 3).repeat(C, 1, 1, 1)
-    xp = F.pad(latent, (1, 1, 1, 1), mode="reflect")
-    lap = F.conv2d(xp, k, groups=C).pow(2).mean(dim=1, keepdim=True)
-    H_out, W_out = target_size or latent.shape[-2:]
-    lap = F.interpolate(lap, size=(H_out, W_out), mode="bilinear",
-                        align_corners=False)
-    return _minmax_per_image(lap, eps)
-
-
-def _variance_saliency(latent, target_size, win=3, eps=1e-6):
-    """Local latent-variance saliency baseline (per-window variance)."""
-    x = latent.mean(dim=1, keepdim=True)
-    pad = win // 2
-    mean = F.avg_pool2d(F.pad(x, (pad,)*4, mode="reflect"), win, stride=1)
-    mean2 = F.avg_pool2d(F.pad(x.pow(2), (pad,)*4, mode="reflect"), win, stride=1)
-    var = (mean2 - mean.pow(2)).clamp_min(0.0)
-    H_out, W_out = target_size or latent.shape[-2:]
-    var = F.interpolate(var, size=(H_out, W_out), mode="bilinear",
-                        align_corners=False)
-    return _minmax_per_image(var, eps)
-
-
-def base_saliency_signal(latent, dwt, signal="wavelet", target_size=None,
-                         eps=1e-6, generator=None):
-    """Return a base (pre-boundary, pre-interior) saliency map in [0,1].
-
-    signal:
-        "wavelet"   - LWD Haar high-frequency energy (paper default)
-        "sobel"     - Sobel gradient magnitude
-        "laplacian" - Laplacian energy
-        "variance"  - local latent variance
-        "random"    - uniform random map (control)
-        "uniform"   - constant 1.0 (no saliency)
-    These are the Table B comparison signals: a frequency-guided method must
-    beat sobel / laplacian / variance to justify the wavelet choice.
-    """
-    H_out, W_out = target_size or latent.shape[-2:]
-    if signal == "wavelet":
-        return lwd_wavelet_saliency(latent, dwt, target_size=(H_out, W_out), eps=eps)
-    if signal == "sobel":
-        return _sobel_saliency(latent, (H_out, W_out), eps)
-    if signal == "laplacian":
-        return _laplacian_saliency(latent, (H_out, W_out), eps)
-    if signal == "variance":
-        return _variance_saliency(latent, (H_out, W_out), eps=eps)
-    if signal == "random":
-        r = torch.rand(latent.shape[0], 1, H_out, W_out,
-                       device=latent.device, dtype=latent.dtype,
-                       generator=generator)
-        return r
-    if signal in ("uniform", "none"):
-        return torch.ones(latent.shape[0], 1, H_out, W_out,
-                          device=latent.device, dtype=latent.dtype)
-    raise ValueError(f"unknown saliency signal: {signal}")
-
-
-def combined_saliency(latent, mask, dwt, boundary_weight=1.0,
-                     boundary_kernel=5, target_size=None, eps=1e-6,
-                     uniform=False, interior_weight=0.0,
-                     signal="wavelet", use_base_signal=True):
-    """A_combined for inpainting: A_wavelet + λ_b · Boundary + λ_m · Interior.
-    
-    Args:
-        uniform: True이면 wavelet saliency 무시하고 모든 위치에 동일값 (1.0).
-                 Boundary도 boundary_weight=0이면 무시됨.
-                 둘 다 끄면 saliency = 1.0 everywhere (사실상 unconditional draft use).
-        interior_weight: Fix #5 (mask interior penalty). > 0이면 mask 내부 전체를
-                 hard region으로 추가 표시. COCO같은 caption-conditioned object
-                 completion에서 mask 내부 semantic mismatch를 잡기 위한 신호.
-                 Wavelet/boundary는 texture/seam에 강하지만 semantic은 못 잡음.
-                 Boundary는 mask 경계만 강조하지만 interior는 mask 전체를 강조.
-                 추천 sweep: 0.3 / 0.5 / 0.8 (boundary_weight=1.0과 함께).
-    """
-    H_out, W_out = target_size or latent.shape[-2:]
-    if uniform:
-        # Uniform: saliency = 1 everywhere. Wavelet 계산 skip.
-        A_w = torch.ones(latent.shape[0], 1, H_out, W_out,
-                         device=latent.device, dtype=latent.dtype)
-    elif not use_base_signal:
-        # Boundary-only / interior-only configs: zero base, components added below.
-        A_w = torch.zeros(latent.shape[0], 1, H_out, W_out,
-                          device=latent.device, dtype=latent.dtype)
-    else:
-        A_w = base_saliency_signal(latent, dwt, signal=signal,
-                                   target_size=(H_out, W_out), eps=eps)
-    if mask.shape[-2:] != (H_out, W_out):
-        mask_r = F.interpolate(mask, size=(H_out, W_out), mode="nearest")
-    else:
-        mask_r = mask
-    comb = A_w
-    if boundary_weight > 0:
-        B_ind = boundary_indicator(mask_r, kernel=boundary_kernel)
-        comb = comb + boundary_weight * B_ind
-    if interior_weight > 0:
-        # Fix #5: mask 내부 전체를 hard region으로 표시.
-        # mask_r는 이미 [0,1] 또는 {0,1} 형태로 mask 내부=1, 외부=0.
-        # 이걸 그대로 saliency에 더하면 mask 내부 patch의 acceptance threshold가
-        # 더 엄격해짐 (saliency 높을수록 tolerance 작음).
-        interior_ind = (mask_r >= 0.5).float()
-        comb = comb + interior_weight * interior_ind
-    B = comb.shape[0]
-    flat = comb.view(B, -1)
-    mn = flat.min(dim=1, keepdim=True)[0]
-    mx = flat.max(dim=1, keepdim=True)[0]
-    return ((flat - mn) / (mx - mn + eps)).view(B, 1, H_out, W_out)
-
-
-def lwd_time_mask(saliency, t_norm, ell=0.3):
-    """
-    LWD Eq.6. t_norm: timestep in [0,1] (NOTE: not raw diffusion step).
-    For DDPM step in [0,T-1], normalize first: t_norm = t / (T-1).
-    """
-    t_ = t_norm.view(-1, 1, 1, 1)
-    return ((saliency + ell) >= t_).float()
+        total = l_distill + l_main + l_uniform
+        return total, {
+            "l_distill": float(l_distill.item()),
+            "l_main": float(l_main.item()),
+            "l_uniform": float(l_uniform.item()),
+            "M_t_active": M_t.mean().item(),
+        }, M_t, sal
 
 
 if __name__ == "__main__":
-    torch.manual_seed(0)
-    dwt = DWT2D("haar")
-    z = torch.randn(2, 4, 32, 32)
-    m = (torch.rand(2, 1, 32, 32) > 0.7).float()
-    A = combined_saliency(z, m, dwt, boundary_weight=1.0)
+    crit = DraftLoss()
+    z0 = torch.randn(2, 4, 32, 32)
+    eps_gt = torch.randn(2, 4, 32, 32)
+    eps_target = eps_gt + 0.1 * torch.randn_like(eps_gt)
+    eps_draft = eps_gt + 0.3 * torch.randn_like(eps_gt)
+    mask = (torch.rand(2, 1, 32, 32) > 0.7).float()
     t_norm = torch.rand(2)
-    M = lwd_time_mask(A, t_norm)
-    print(f"A: {A.shape}, range [{A.min():.3f},{A.max():.3f}]")
-    print(f"M_t active ratio: {M.mean():.3f}")
+    loss, logs, M_t, sal = crit(eps_draft, eps_target, eps_gt, z0, mask, t_norm)
+    print(f"loss: {loss.item():.4f}")
+    print(f"logs: {logs}")
