@@ -60,6 +60,17 @@ run_variant () {
   echo "==================================================================="
   echo "[table_c] variant=${name}  flags='${flags}'  -> ${out}"
   echo "==================================================================="
+  # already finished? skip.
+  if [ -f "${out}/draft_final.pt" ]; then
+    echo "[table_c] SKIP ${name}: draft_final.pt already exists."
+    return 0
+  fi
+  # partial run? resume from the latest checkpoint.
+  local resume_arg=""
+  if [ -f "${out}/draft_latest.pt" ]; then
+    echo "[table_c] RESUME ${name} from draft_latest.pt"
+    resume_arg="--resume ${out}/draft_latest.pt"
+  fi
   python -m training.train \
     --target_id "${TARGET_ID}" \
     --data_root "${DATA_ROOT}" \
@@ -69,6 +80,7 @@ run_variant () {
     --lr "${LR}" \
     --max_steps "${STEPS}" \
     --alpha_distill "${A}" --gamma_main "${G}" --lambda_uniform "${U}" \
+    ${resume_arg} \
     ${flags}
 }
 
