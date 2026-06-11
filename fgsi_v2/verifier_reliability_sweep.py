@@ -117,6 +117,16 @@ def run_one_logged(target, draft, sch, dwt, item, args, device):
             ),
             device,
         )
+    # optional: save out.png/gt.png/mask.png for Mask LPIPS_t (Table C)
+    if getattr(args, "save_outputs", False):
+        from baseline_sweep import save_rgb, save_gray
+        out = target.decode_latent(z_out)
+        out = img * (1 - mask_pix) + out * mask_pix
+        d = os.path.join(args.out_root, "outputs", f"img_{item['idx']:03d}")
+        os.makedirs(d, exist_ok=True)
+        save_rgb(img, os.path.join(d, "gt.png"))
+        save_rgb(out, os.path.join(d, "out.png"))
+        save_gray(mask_pix, os.path.join(d, "mask.png"))
     return stats, t_run
 
 
@@ -206,6 +216,10 @@ def get_parser():
                    help="Diffusion/mask seeds. Use e.g. 42 43 44 for paired "
                         "multi-seed evaluation (200 images x 3 seeds).")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--save_outputs", action="store_true",
+                   help="Also save out/gt/mask png per image (for Mask LPIPS_t "
+                        "in Table C). Use a single seed so dirs match the "
+                        "target_s50 reference.")
     p.add_argument("--device", default="cuda")
     p.add_argument("--target_dtype", default="fp16",
                    choices=["fp16", "bf16", "fp32"])
