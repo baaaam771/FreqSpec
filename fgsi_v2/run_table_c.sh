@@ -40,15 +40,15 @@ TRAIN_STAGE_SUFFIX="prune"   # drafts live in <TRAIN_BASE>/<variant>_<suffix>/dr
 
 # variant_dir (assemble_table_c.py names)  ->  trained-draft dir name
 declare -A VARIANT_TRAINDIR
-# VARIANT_TRAINDIR["global_gt_only"]="global_gt_only"
+VARIANT_TRAINDIR["global_gt_only"]="global_gt_only"
 VARIANT_TRAINDIR["global_distill_only"]="global_distill_only"
-# VARIANT_TRAINDIR["hard_gt_only"]="hard_gt_only"
-# VARIANT_TRAINDIR["easy_distill_hard_gt"]="easy_distill_hard_gt"
-# VARIANT_TRAINDIR["easy_distill_uniform_gt"]="easy_distill_uniform_gt"
-# VARIANT_TRAINDIR["hard_gt_uniform_gt"]="hard_gt_uniform_gt"
+VARIANT_TRAINDIR["hard_gt_only"]="hard_gt_only"
+VARIANT_TRAINDIR["easy_distill_hard_gt"]="easy_distill_hard_gt"
+VARIANT_TRAINDIR["easy_distill_uniform_gt"]="easy_distill_uniform_gt"
+VARIANT_TRAINDIR["hard_gt_uniform_gt"]="hard_gt_uniform_gt"
 VARIANT_TRAINDIR["full_region_aware"]="full_region_aware"
-# VARIANT_TRAINDIR["full_mask_only_Mt"]="full_mask_only_Mt"
-# VARIANT_TRAINDIR["full_static_M"]="full_static_M"
+VARIANT_TRAINDIR["full_mask_only_Mt"]="full_mask_only_Mt"
+VARIANT_TRAINDIR["full_static_M"]="full_static_M"
 
 STAGE="${1:-all}"
 
