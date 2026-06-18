@@ -42,16 +42,16 @@ echo "[table_c] stage=$STAGE steps=$STEPS"
 
 # variant name -> extra train.py flags
 declare -A VARIANTS
-VARIANTS["global_gt_only"]="--no_distill --no_hard_gt"                       # uniform GT everywhere only
+# VARIANTS["global_gt_only"]="--no_distill --no_hard_gt"                       # uniform GT everywhere only
 VARIANTS["global_distill_only"]="--distill_global --no_hard_gt --no_uniform_gt"
-VARIANTS["hard_gt_only"]="--no_distill --no_uniform_gt"
-VARIANTS["easy_distill_hard_gt"]="--no_uniform_gt"
-VARIANTS["easy_distill_uniform_gt"]="--no_hard_gt"
-VARIANTS["hard_gt_uniform_gt"]="--no_distill"
+# VARIANTS["hard_gt_only"]="--no_distill --no_uniform_gt"
+# VARIANTS["easy_distill_hard_gt"]="--no_uniform_gt"
+# VARIANTS["easy_distill_uniform_gt"]="--no_hard_gt"
+# VARIANTS["hard_gt_uniform_gt"]="--no_distill"
 VARIANTS["full_region_aware"]=""                                            # paper default
 # extra design-choice variants
-VARIANTS["full_mask_only_Mt"]="--mask_no_base"                              # M_t from mask geometry only
-VARIANTS["full_static_M"]="--static_mask"                                   # timestep-independent M
+# VARIANTS["full_mask_only_Mt"]="--mask_no_base"                              # M_t from mask geometry only
+# VARIANTS["full_static_M"]="--static_mask"                                   # timestep-independent M
 
 run_variant () {
   local name="$1"; local flags="$2"
