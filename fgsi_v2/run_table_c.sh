@@ -33,8 +33,8 @@ NUM_IMAGES=200          # fixed COCO eval set for all variants
 IMAGE_SIZE=1024
 SEED=42                 # single seed so outputs match target_s50 reference
 DEVICE="cuda"
-# TRAIN_STAGE_SUFFIX="full"   # drafts live in <TRAIN_BASE>/<variant>_<suffix>/draft_final.pt
-TRAIN_STAGE_SUFFIX="prune"   # drafts live in <TRAIN_BASE>/<variant>_<suffix>/draft_final.pt
+TRAIN_STAGE_SUFFIX="full"  # drafts live in <TRAIN_BASE>/<variant>_<suffix>/draft_final.pt
+# TRAIN_STAGE_SUFFIX="prune"   # drafts live in <TRAIN_BASE>/<variant>_<suffix>/draft_final.pt
 
 # --------------------------------
 
