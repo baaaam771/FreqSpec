@@ -80,9 +80,17 @@ class SRTargetWrapper(nn.Module):
             # x4 upscaler: latent operates at LR resolution; VAE decode upsamples x4.
             self.vae_upscale = 4
             pred = getattr(self.scheduler_ref.config, "prediction_type", "epsilon")
-            if pred != "epsilon":
+            self.prediction_type = pred
+            # The generalized sampler works in epsilon space. For v-prediction
+            # targets (e.g. the x4 upscaler) we convert the UNet output to
+            # epsilon inside predict_eps using the model's own alphas_cumprod.
+            self.alphas_cumprod = self.scheduler_ref.alphas_cumprod.to(device)
+            if pred not in ("epsilon", "v_prediction"):
                 print(f"[SRTargetWrapper] WARNING: prediction_type={pred} "
-                      f"(generalized DDIM step assumes epsilon)")
+                      f"unhandled (only epsilon / v_prediction supported)")
+            else:
+                print(f"[SRTargetWrapper] prediction_type={pred} "
+                      f"({'v->eps conversion ON' if pred == 'v_prediction' else 'native eps'})")
             in_ch = getattr(self.unet.config, "in_channels", None)
             if in_ch is not None and in_ch != 7:
                 print(f"[SRTargetWrapper] WARNING: unet.in_channels={in_ch} "
@@ -95,6 +103,8 @@ class SRTargetWrapper(nn.Module):
             self.latent_ch = 4
             self.vae_scaling = 0.08333
             self.vae_upscale = 4
+            self.prediction_type = "epsilon"
+            self.alphas_cumprod = None
 
     @property
     def available(self):
@@ -209,17 +219,28 @@ class SRTargetWrapper(nn.Module):
             t2 = torch.cat([t, t], dim=0) if t.dim() > 0 else t
             emb2 = torch.cat([uncond_emb, cond_emb], dim=0)
             nl2 = torch.cat([noise_level, noise_level], dim=0)
-            eps_both = self.unet(
+            out_both = self.unet(
                 unet_in2, t2, encoder_hidden_states=emb2, class_labels=nl2,
             ).sample
-            eps_u, eps_c = eps_both.chunk(2, dim=0)
-            eps = eps_u + guidance_scale * (eps_c - eps_u)
+            out_u, out_c = out_both.chunk(2, dim=0)
+            model_out = out_u + guidance_scale * (out_c - out_u)
         else:
             if uncond_emb is None:
                 uncond_emb = self._get_uncond_embedding(B)
-            eps = self.unet(
+            model_out = self.unet(
                 unet_in, t, encoder_hidden_states=uncond_emb, class_labels=noise_level,
             ).sample
+
+        # Convert to epsilon space if the target is a v-prediction model.
+        # CFG is affine in the model output, so converting the combined output
+        # is equivalent to converting each branch:  eps = sqrt(ab)*v + sqrt(1-ab)*z
+        if self.prediction_type == "v_prediction":
+            ac = self.alphas_cumprod[t].to(model_out.dtype).view(-1, 1, 1, 1)
+            sqrt_ac = ac.sqrt()
+            sqrt_1m = (1.0 - ac).sqrt()
+            eps = sqrt_ac * model_out + sqrt_1m * z_t.to(model_out.dtype)
+        else:
+            eps = model_out
         return eps.to(z_t.dtype)
 
 
