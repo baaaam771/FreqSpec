@@ -64,7 +64,10 @@ class SRTargetWrapper(nn.Module):
             )
             self.pipe.to(device)
             self.unet = self.pipe.unet.eval()
-            self.vae = self.pipe.vae.eval()
+            # The x4-upscaler VAE is numerically unstable in low precision
+            # (bf16/fp16 decode yields black/NaN images on some latents), so we
+            # keep the VAE in fp32 while the UNet runs in the requested dtype.
+            self.vae = self.pipe.vae.eval().float()
             self.scheduler_ref = self.pipe.scheduler
             self.low_res_scheduler = self.pipe.low_res_scheduler
             self.tokenizer = self.pipe.tokenizer
@@ -152,7 +155,7 @@ class SRTargetWrapper(nn.Module):
             z3 = F.interpolate(image, size=(H // self.vae_upscale, W // self.vae_upscale),
                                mode="bilinear", align_corners=False)
             return torch.cat([z3, z3.mean(dim=1, keepdim=True)], dim=1)
-        z = self.vae.encode(image.to(self.dtype)).latent_dist.sample()
+        z = self.vae.encode(image.float()).latent_dist.sample()
         return z * self.vae_scaling
 
     @torch.no_grad()
@@ -162,7 +165,7 @@ class SRTargetWrapper(nn.Module):
             z3 = z[:, :3]
             return F.interpolate(z3, size=(h * self.vae_upscale, w * self.vae_upscale),
                                  mode="bilinear", align_corners=False).clamp(-1, 1)
-        x = self.vae.decode(z.to(self.dtype) / self.vae_scaling).sample
+        x = self.vae.decode(z.float() / self.vae_scaling).sample
         return x.clamp(-1, 1)
 
     @torch.no_grad()
