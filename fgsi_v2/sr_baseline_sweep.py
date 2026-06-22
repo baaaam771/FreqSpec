@@ -81,12 +81,12 @@ def load_image(path, size):
 
 
 def save_rgb(t, path):
-    t = (t.clamp(-1, 1) + 1) / 2
+    t = (t.float().clamp(-1, 1) + 1) / 2
     Image.fromarray((t[0].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")).save(path)
 
 
 def save_gray(t, path):
-    Image.fromarray((t[0, 0].cpu().numpy() * 255).clip(0, 255).astype("uint8")).save(path)
+    Image.fromarray((t[0, 0].float().cpu().numpy() * 255).clip(0, 255).astype("uint8")).save(path)
 
 
 def build_manifest(args):
