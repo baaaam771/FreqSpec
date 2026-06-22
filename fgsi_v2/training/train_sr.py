@@ -25,7 +25,58 @@ from models.sr_target_wrapper import SRTargetWrapper
 from models.draft import DraftEpsUNet
 from training.scheduler import DDPMSchedule
 from training.losses import DraftLoss
-from training.train import ImageDataset  # reuse recursive image dataset
+from training.train import ImageDataset  # reuse recursive image dataset (center-crop)
+
+import glob
+from PIL import Image, ImageFile
+from torch.utils.data import Dataset
+from torchvision import transforms
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+class SRRandomCropDataset(Dataset):
+    """Random-crop HR patches at native resolution for SR draft training.
+
+    SR draft training needs high-frequency diversity: cropping native HR (no
+    downscale-resize) preserves real texture/edge content, and random location
+    + flip exposes the draft to varied high-frequency patterns so it learns
+    where it can agree with the target. Falls back to resize when an image is
+    smaller than the crop on some side (not expected for DIV2K, min side 648).
+    """
+    def __init__(self, root, crop_size, exts=("png", "jpg", "jpeg", "webp")):
+        self.paths = []
+        for e in exts:
+            self.paths += glob.glob(os.path.join(root, "**", f"*.{e}"), recursive=True)
+        self.paths = sorted(self.paths)
+        if not self.paths:
+            raise SystemExit(f"[SRRandomCropDataset] no images under {root}")
+        print(f"[SRRandomCropDataset] found {len(self.paths)} images under {root} "
+              f"(random-crop {crop_size})")
+        self.crop = crop_size
+        self.flip = transforms.RandomHorizontalFlip(0.5)
+        self.to_tensor = transforms.ToTensor()
+        self.norm = transforms.Normalize([0.5] * 3, [0.5] * 3)
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        for _ in range(8):  # retry on rare decode errors
+            try:
+                img = Image.open(self.paths[idx]).convert("RGB")
+                break
+            except Exception:
+                idx = (idx + 1) % len(self.paths)
+        w, h = img.size
+        c = self.crop
+        if w < c or h < c:  # safety fallback: short-side resize then crop
+            img = transforms.Resize(c)(img)
+            w, h = img.size
+        x = _rnd.randint(0, w - c)
+        y = _rnd.randint(0, h - c)
+        img = img.crop((x, y, x + c, y + c))
+        img = self.flip(img)
+        return self.norm(self.to_tensor(img))
 
 
 def train(args):
@@ -75,8 +126,11 @@ def train(args):
 
     hr_size = args.lr_size * args.scale
     if args.data_root and os.path.isdir(args.data_root):
-        ds = ImageDataset(args.data_root, image_size=hr_size,
-                          default_prompt=args.default_prompt, return_prompt=False)
+        if args.center_crop:
+            ds = ImageDataset(args.data_root, image_size=hr_size,
+                              default_prompt=args.default_prompt, return_prompt=False)
+        else:
+            ds = SRRandomCropDataset(args.data_root, crop_size=hr_size)
         loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
                             num_workers=args.num_workers, drop_last=True)
         use_dummy = False
@@ -191,12 +245,14 @@ def get_parser():
     p.add_argument("--out_dir", type=str, default="./ckpt_sr")
     p.add_argument("--target_id", type=str,
                    default="stabilityai/stable-diffusion-x4-upscaler")
-    p.add_argument("--target_dtype", type=str, default="fp16",
+    p.add_argument("--target_dtype", type=str, default="bf16",
                    choices=["fp16", "bf16", "fp32"])
     p.add_argument("--lr_size", type=int, default=128)
     p.add_argument("--scale", type=int, default=4)
     p.add_argument("--noise_level", type=int, default=20)
     p.add_argument("--default_prompt", type=str, default="")
+    p.add_argument("--center_crop", action="store_true",
+                   help="use center-crop (default: random-crop at native HR res)")
     # draft architecture (82M default to match the inpainting draft)
     p.add_argument("--draft_base_ch", type=int, default=128)
     p.add_argument("--draft_ch_mult", type=int, nargs="+", default=[1, 2, 4, 4])
