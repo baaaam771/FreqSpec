@@ -51,12 +51,18 @@ class DraftEpsUNet(nn.Module):
     Default size: ~50M params (medium draft). Adjustable via constructor.
     """
     def __init__(self, latent_ch=4, base_ch=128, ch_mult=(1, 2, 4, 4), t_dim=512,
-                 num_train_timesteps=1000):
+                 num_train_timesteps=1000, cond_ch=None, use_mask=True):
         super().__init__()
         self.num_train_timesteps = num_train_timesteps
         self.latent_ch = latent_ch
+        # cond_ch: number of conditioning channels concatenated with z_t.
+        #   inpainting -> masked-image latent (4); SR -> low-res RGB (3).
+        # use_mask:  whether a region/mask channel is concatenated.
+        #   inpainting -> True (mask channel); SR -> False (whole field).
+        self.cond_ch = latent_ch if cond_ch is None else cond_ch
+        self.use_mask = use_mask
 
-        in_ch = latent_ch + 1 + latent_ch  # z_t + mask + cond
+        in_ch = latent_ch + (1 if use_mask else 0) + self.cond_ch  # z_t [+ mask] + cond
         self.t_dim = t_dim
         self.t_mlp = nn.Sequential(
             nn.Linear(t_dim, t_dim), nn.SiLU(), nn.Linear(t_dim, t_dim)
@@ -90,15 +96,21 @@ class DraftEpsUNet(nn.Module):
         self.out_norm = nn.GroupNorm(8, prev)
         self.out_conv = nn.Conv2d(prev, latent_ch, 3, padding=1)
 
-    def forward(self, z_t, t, cond, mask):
+    def forward(self, z_t, t, cond, mask=None):
         """
         z_t:   [B, 4, H, W]
         t:     [B] integer in [0, num_train_timesteps)
-        cond:  [B, 4, H, W]
-        mask:  [B, 1, H, W]
+        cond:  [B, cond_ch, H, W]   (masked-image latent for inpaint; LR RGB for SR)
+        mask:  [B, 1, H, W] or None (region channel; ignored when use_mask=False)
         return: eps_hat [B, 4, H, W]
         """
-        x = torch.cat([z_t, mask, cond], dim=1)  # 9 channels
+        if self.use_mask:
+            if mask is None:
+                mask = torch.ones(z_t.shape[0], 1, *z_t.shape[-2:],
+                                  device=z_t.device, dtype=z_t.dtype)
+            x = torch.cat([z_t, mask, cond], dim=1)
+        else:
+            x = torch.cat([z_t, cond], dim=1)
         t_emb = self.t_mlp(timestep_embedding(t.float(), self.t_dim))
 
         h = self.stem(x)
