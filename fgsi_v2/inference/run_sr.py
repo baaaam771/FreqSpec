@@ -205,7 +205,7 @@ def get_parser():
     p.add_argument("--prompt", type=str, default="")
     p.add_argument("--guidance_scale", type=float, default=1.0,
                    help="x4 upscaler typically uses low/no CFG.")
-    p.add_argument("--target_dtype", type=str, default="fp16",
+    p.add_argument("--target_dtype", type=str, default="bf16",
                    choices=["fp16", "bf16", "fp32"])
     p.add_argument("--use_ema_draft", action="store_true")
     p.add_argument("--K", type=int, default=3)
