@@ -80,6 +80,26 @@ def load_image(path, size):
     ])(img).unsqueeze(0)
 
 
+def load_image_native(path, scale):
+    """Load HR at native resolution, center-cropped to a multiple of 8*scale.
+
+    For standard SR benchmarks (Set5/14, BSD100, Urban100) images vary in size
+    and are mostly below 512, so the fixed 512 center-crop in load_image would
+    upscale-then-evaluate (invalid SR). Native mode keeps the original HR and
+    only crops to make latent dims (HR/scale) divisible by 8 (UNet) and 4 (patch).
+    """
+    img = Image.open(path).convert("RGB")
+    w, h = img.size
+    m = 8 * scale  # HR multiple so that latent = HR/scale is divisible by 8
+    cw, ch = (w // m) * m, (h // m) * m
+    cw, ch = max(cw, m), max(ch, m)
+    left, top = (w - cw) // 2, (h - ch) // 2
+    img = img.crop((left, top, left + cw, top + ch))
+    t = transforms.ToTensor()(img)
+    t = transforms.Normalize([0.5] * 3, [0.5] * 3)(t)
+    return t.unsqueeze(0)
+
+
 def save_rgb(t, path):
     t = (t.float().clamp(-1, 1) + 1) / 2
     Image.fromarray((t[0].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")).save(path)
@@ -113,14 +133,19 @@ def timed_run(fn, device):
 
 
 def _prepare(target, item, args, device):
-    hr_size = args.lr_size * args.scale
-    hr = load_image(item["image_path"], hr_size).to(device)
-    lr = F.interpolate(hr, size=(args.lr_size, args.lr_size),
-                       mode="bicubic", align_corners=False).clamp(-1, 1)
+    if args.native_res:
+        hr = load_image_native(item["image_path"], args.scale).to(device)
+        Hh, Ww = hr.shape[-2:]
+        hl, wl = Hh // args.scale, Ww // args.scale
+    else:
+        hr_size = args.lr_size * args.scale
+        hr = load_image(item["image_path"], hr_size).to(device)
+        hl = wl = args.lr_size
+    lr = F.interpolate(hr, size=(hl, wl), mode="bicubic", align_corners=False).clamp(-1, 1)
     cond_lr, nl = target.prepare_lr_cond(lr, noise_level=args.noise_level)
-    region = torch.ones(1, 1, args.lr_size, args.lr_size, device=device)
+    region = torch.ones(1, 1, hl, wl, device=device)
     torch.manual_seed(item["seed"])
-    z_init = torch.randn(1, target.latent_ch, args.lr_size, args.lr_size, device=device)
+    z_init = torch.randn(1, target.latent_ch, hl, wl, device=device)
     if target.available:
         cond_emb, uncond_emb, _ = target.get_text_embeddings(
             item["prompt"], batch_size=1, guidance_scale=args.guidance_scale)
@@ -270,11 +295,14 @@ def get_parser():
     p.add_argument("--draft_ckpt", type=str, default="")
     p.add_argument("--target_id", type=str,
                    default="stabilityai/stable-diffusion-x4-upscaler")
-    p.add_argument("--target_dtype", type=str, default="fp16",
+    p.add_argument("--target_dtype", type=str, default="bf16",
                    choices=["fp16", "bf16", "fp32"])
     p.add_argument("--use_ema_draft", action="store_true")
     p.add_argument("--num_images", type=int, default=100)
     p.add_argument("--lr_size", type=int, default=128)
+    p.add_argument("--native_res", action="store_true",
+                   help="evaluate at each image's native HR (crop to mult of 8*scale); "
+                        "use for SR benchmarks where images vary in size / are <512")
     p.add_argument("--scale", type=int, default=4)
     p.add_argument("--noise_level", type=int, default=20)
     p.add_argument("--num_steps", type=int, default=50)
