@@ -64,8 +64,10 @@ SR_TOL_PRESETS = [
 
 
 def build_method_list(args):
-    methods = [{"name": f"target_s{s}", "type": "target", "num_steps": s,
-                "tol_low": None, "tol_high": None} for s in args.target_steps]
+    methods = []
+    if not args.freqspec_only:
+        methods += [{"name": f"target_s{s}", "type": "target", "num_steps": s,
+                     "tol_low": None, "tol_high": None} for s in args.target_steps]
     for name, tl, th in SR_TOL_PRESETS:
         methods.append({"name": name, "type": "freqspec",
                         "num_steps": args.num_steps, "tol_low": tl, "tol_high": th})
@@ -322,6 +324,8 @@ def get_parser():
     p.add_argument("--drift_k_switch_threshold", type=float, default=0.006)
     p.add_argument("--saliency_x0_coupling", type=float, default=0.0,
                    help="couple wavelet saliency into the x0 gate (SR freq ablation; 0=off)")
+    p.add_argument("--freqspec_only", action="store_true",
+                   help="skip target_sN baselines (for coupling reruns)")
     p.add_argument("--k_switch_threshold", type=float, default=0.60)
     p.add_argument("--save_usage_maps", action="store_true")
     p.add_argument("--resume", action="store_true")
