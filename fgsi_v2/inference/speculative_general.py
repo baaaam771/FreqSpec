@@ -85,6 +85,7 @@ def fgsr_refine(
     x0_thr_loose: float = None,
     x0_strict_center: float = None,
     x0_strict_width: float = 0.12,
+    saliency_x0_coupling: float = 0.0,
     drift_k_switch_threshold: float = None,
     return_usage_map: bool = False,
     collect_patch_logs: bool = False,
@@ -134,6 +135,7 @@ def fgsr_refine(
         blend_temperature=blend_temperature, x0_threshold=x0_threshold,
         x0_thr_strict=x0_thr_strict, x0_thr_loose=x0_thr_loose,
         x0_strict_center=x0_strict_center, x0_strict_width=x0_strict_width,
+        saliency_x0_coupling=saliency_x0_coupling,
     )
 
     i = 0

@@ -127,6 +127,7 @@ def run_one_logged(target, draft, sch, dwt, item, seed, args, device):
             blend_temperature=args.blend_temperature,
             x0_thr_strict=args.x0_thr_strict, x0_thr_loose=args.x0_thr_loose,
             x0_strict_center=args.x0_strict_center, x0_strict_width=args.x0_strict_width,
+            saliency_x0_coupling=args.saliency_x0_coupling,
             drift_k_switch_threshold=args.drift_k_switch_threshold,
             k_switch_threshold=args.k_switch_threshold,
             dwt=dwt, collect_patch_logs=True, target_extra={"noise_level": nl})
@@ -185,7 +186,7 @@ def get_parser():
     p.add_argument("--draft_ckpt", type=str, default="")
     p.add_argument("--target_id", type=str,
                    default="stabilityai/stable-diffusion-x4-upscaler")
-    p.add_argument("--target_dtype", type=str, default="fp16",
+    p.add_argument("--target_dtype", type=str, default="bf16",
                    choices=["fp16", "bf16", "fp32"])
     p.add_argument("--use_ema_draft", action="store_true")
     p.add_argument("--num_images", type=int, default=100)
@@ -208,6 +209,8 @@ def get_parser():
     p.add_argument("--x0_thr_loose", type=float, default=0.07)
     p.add_argument("--x0_strict_center", type=float, default=0.45)
     p.add_argument("--x0_strict_width", type=float, default=0.12)
+    p.add_argument("--saliency_x0_coupling", type=float, default=0.0,
+                   help="couple wavelet saliency into the x0 gate (SR freq ablation; 0=off)")
     p.add_argument("--drift_k_switch_threshold", type=float, default=0.006)
     p.add_argument("--k_switch_threshold", type=float, default=0.60)
     p.add_argument("--resume", action="store_true")

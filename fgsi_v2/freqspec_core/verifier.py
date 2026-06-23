@@ -53,6 +53,11 @@ class VerifierConfig:
     x0_thr_loose: float = None
     x0_strict_center: float = None
     x0_strict_width: float = 0.12
+    # SR frequency ablation: couple the (wavelet) saliency into the binding x0
+    # gate so high-frequency patches get a tighter threshold. 0 = current
+    # behaviour (x0 gate independent of saliency); >0 injects frequency into the
+    # acceptance signal, the deployable form of the AURC frequency-mixing result.
+    saliency_x0_coupling: float = 0.0
 
 
 # ============================================================
@@ -110,8 +115,15 @@ def compute_acceptance(s_eps, d_x0, saliency_patch, region_patch, t_norm,
 
     accept_eps = (s_eps > (1.0 - tol_patch))
     x0_thr = resolve_x0_threshold(t_norm, cfg)
+    # Couple (wavelet) saliency into the x0 gate: high-saliency patches get a
+    # tighter effective threshold. x0_thr_eff is a tensor when coupling>0.
+    if x0_thr is not None and cfg.saliency_x0_coupling > 0:
+        x0_thr_eff = x0_thr * (1.0 - cfg.saliency_x0_coupling
+                               * saliency_patch.clamp(0.0, 1.0))
+    else:
+        x0_thr_eff = x0_thr
     if x0_thr is not None:
-        accept = (accept_eps & (d_x0 < x0_thr)).float() * region_bool
+        accept = (accept_eps & (d_x0 < x0_thr_eff)).float() * region_bool
     else:
         accept = accept_eps.float() * region_bool
 
@@ -120,7 +132,7 @@ def compute_acceptance(s_eps, d_x0, saliency_patch, region_patch, t_norm,
         margin = s_eps - (1.0 - tol_patch)
         w = torch.sigmoid(margin / bt)
         if x0_thr is not None:
-            w = w * torch.sigmoid((x0_thr - d_x0) / max(bt, 1e-6))
+            w = w * torch.sigmoid((x0_thr_eff - d_x0) / max(bt, 1e-6))
         w = w * region_bool
     else:
         w = accept
