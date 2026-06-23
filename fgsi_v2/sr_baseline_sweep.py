@@ -167,7 +167,7 @@ def run_one(target, draft, sch, dwt, item, method, args, device):
         if method["type"] == "target":
             (z_out, stats), t_run = timed_run(lambda: baseline_refine(
                 target, z_init.clone(), cond_lr, region, sch,
-                num_inference_steps=method["num_steps"],
+                num_inference_steps=method["num_steps"], exact_schedule=args.exact_schedule,
                 guidance_scale=args.guidance_scale,
                 cond_emb=cond_emb, uncond_emb=uncond_emb,
                 known_z=None, blend_known=False, target_extra=extra), device)
@@ -176,7 +176,8 @@ def run_one(target, draft, sch, dwt, item, method, args, device):
         else:
             (z_out, stats), t_run = timed_run(lambda: fgsr_refine(
                 target, draft, z_init.clone(), cond_lr, region, sch,
-                num_inference_steps=method["num_steps"], K=args.K, patch_size=args.patch,
+                num_inference_steps=method["num_steps"], exact_schedule=args.exact_schedule,
+                K=args.K, patch_size=args.patch,
                 t_spec_start_norm=args.t_spec_start, beta=args.beta,
                 tol_low=method["tol_low"], tol_high=method["tol_high"],
                 boundary_weight=0.0, mask_interior_weight=0.0,  # SR: wavelet-only
@@ -326,6 +327,8 @@ def get_parser():
                    help="couple wavelet saliency into the x0 gate (SR freq ablation; 0=off)")
     p.add_argument("--freqspec_only", action="store_true",
                    help="skip target_sN baselines (for coupling reruns)")
+    p.add_argument("--exact_schedule", action="store_true",
+                   help="use exactly-N DDIM steps (for matched-cost target NFE)")
     p.add_argument("--k_switch_threshold", type=float, default=0.60)
     p.add_argument("--save_usage_maps", action="store_true")
     p.add_argument("--resume", action="store_true")

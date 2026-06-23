@@ -68,6 +68,20 @@ class DDPMSchedule:
         ts = torch.arange(0, self.num_train_timesteps, step, device=self.device).flip(0)
         return ts  # [num_inference_steps]
 
+    def get_ddim_schedule_exact(self, num_inference_steps: int):
+        """Return EXACTLY num_inference_steps descending integer timesteps.
+
+        Unlike get_ddim_schedule (which uses T//N spacing and therefore collapses
+        adjacent N, e.g. 44 and 45 both -> 46 steps), this uses linspace so the
+        realized NFE equals the requested N. Used for matched-cost target
+        baselines where the target NFE must be set precisely. The original
+        get_ddim_schedule is left unchanged so existing (WACV / prior SR) results
+        remain reproducible.
+        """
+        ts = torch.linspace(self.num_train_timesteps - 1, 0,
+                            num_inference_steps, device=self.device)
+        return ts.round().long()
+
     def ddim_step(
         self,
         z_t: torch.Tensor,

@@ -51,6 +51,7 @@ def fgsr_refine(
     region_z: torch.Tensor,
     scheduler: DDPMSchedule,
     num_inference_steps: int = 50,
+    exact_schedule: bool = False,
     K: int = 3,
     patch_size: int = 4,
     t_spec_start_norm: float = 0.7,
@@ -110,7 +111,8 @@ def fgsr_refine(
     if dwt is None:
         dwt = DWT2D("haar").to(device)
 
-    ts = scheduler.get_ddim_schedule(num_inference_steps)
+    ts = (scheduler.get_ddim_schedule_exact(num_inference_steps)
+          if exact_schedule else scheduler.get_ddim_schedule(num_inference_steps))
     N = len(ts)
     z = z_init.clone()
     B, C, H, W = z.shape
@@ -277,12 +279,13 @@ def fgsr_refine(
 
 @torch.no_grad()
 def baseline_refine(target, z_init, cond_z, region_z, scheduler,
-                    num_inference_steps=50, guidance_scale=1.0,
+                    num_inference_steps=50, exact_schedule=False, guidance_scale=1.0,
                     cond_emb=None, uncond_emb=None,
                     known_z=None, blend_known=False, target_extra=None):
     """Target-only DDIM baseline (task-agnostic)."""
     target_extra = target_extra or {}
-    ts = scheduler.get_ddim_schedule(num_inference_steps)
+    ts = (scheduler.get_ddim_schedule_exact(num_inference_steps)
+          if exact_schedule else scheduler.get_ddim_schedule(num_inference_steps))
     N = len(ts)
     z = z_init.clone()
     B = z.shape[0]
