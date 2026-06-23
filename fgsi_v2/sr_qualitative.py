@@ -190,9 +190,16 @@ def main(args):
     if not rows:
         print("[sr-qual] nothing to plot"); return
 
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+
+    # Usage and HF share one colormap + [0,1] scale so a single colorbar applies
+    # to both: where draft usage is bright, high-frequency is dark and vice versa.
+    SHARED_CMAP = "magma"
     ncol = 6
-    titles = ["LR (bicubic x4)", "Target-50", "FreqSpec", "Draft usage w(p)",
-              "High-freq map", "FreqSpec (zoom)"]
+    titles = ["LR (bicubic x4)", "Target-50", "FreqSpec",
+              "Draft usage w(p)\n(high = draft)", "High-freq map\n(high = texture)",
+              "FreqSpec (zoom)"]
     fig, axes = plt.subplots(len(rows), ncol, figsize=(ncol * 2.6, len(rows) * 2.7))
     if len(rows) == 1:
         axes = axes[None, :]
@@ -201,14 +208,14 @@ def main(args):
         for j in range(ncol):
             ax = axes[i, j]
             if j == 3:
-                im = ax.imshow(row["usage"], cmap="magma", vmin=0, vmax=1)
+                ax.imshow(row["usage"], cmap=SHARED_CMAP, vmin=0, vmax=1)
                 ax.text(0.03, 0.06,
                         f"acc={row['accept']:.2f}\nNFE={row['nfe']:.0f}\nr={row['r']:+.2f}",
                         transform=ax.transAxes, color="white", fontsize=7,
                         va="bottom", ha="left",
                         bbox=dict(facecolor="black", alpha=0.4, pad=1.5, lw=0))
             elif j == 4:
-                ax.imshow(row["hf"], cmap="viridis", vmin=0, vmax=1)
+                ax.imshow(row["hf"], cmap=SHARED_CMAP, vmin=0, vmax=1)
             else:
                 ax.imshow(np.clip(panels[j], 0, 1))
             ax.set_xticks([]); ax.set_yticks([])
@@ -216,7 +223,16 @@ def main(args):
                 ax.set_title(titles[j], fontsize=9)
             if j == 0:
                 ax.set_ylabel(row["name"], fontsize=8)
-    plt.tight_layout()
+
+    # leave room on the right for one shared colorbar spanning columns 4-5
+    fig.tight_layout(rect=[0, 0, 0.91, 1])
+    sm = ScalarMappable(norm=Normalize(0, 1), cmap=SHARED_CMAP)
+    sm.set_array([])
+    cax = fig.add_axes([0.925, 0.18, 0.012, 0.64])
+    cb = fig.colorbar(sm, cax=cax)
+    cb.set_label("normalized intensity  (0 = low, 1 = high)", fontsize=8)
+    cb.ax.tick_params(labelsize=7)
+
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     fig.savefig(args.out, dpi=args.dpi, bbox_inches="tight")
     pdf = os.path.splitext(args.out)[0] + ".pdf"
@@ -225,7 +241,8 @@ def main(args):
 
     mean_r = np.nanmean([row["r"] for row in rows])
     print(f"[sr-qual] mean corr(draft-usage, low-freq) = {mean_r:+.3f}  "
-          f"(positive => draft concentrates on smooth regions)")
+          f"(positive => draft concentrates on smooth regions; usage and HF maps "
+          f"share one colorbar so the anti-correlation is read directly)")
 
 
 def get_parser():
