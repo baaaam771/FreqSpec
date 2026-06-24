@@ -113,12 +113,14 @@ def main(args):
                 chunks[k].append(v.flatten().cpu().numpy())
             t_ids.append(np.full(d_x0.numel(), int(tv), dtype=np.int32))
             if len(example_maps) < args.n_example_maps and int(tv) == int(ts_grid[len(ts_grid) // 2]):
+                sm = s_eps[0, 0].cpu().numpy()
+                thr = np.quantile(sm, 1.0 - args.accept_ratio)
                 example_maps.append(dict(
                     t=int(tv),
-                    s_eps=s_eps[0, 0].cpu().numpy(),
+                    s_eps=sm,
                     d_x0=d_x0[0, 0].cpu().numpy(),
                     wav=wav[0, 0].cpu().numpy(),
-                    accept=(s_eps[0, 0] > (1 - args.tol)).float().cpu().numpy()))
+                    accept=(sm >= thr).astype(np.float32)))
         nb += 1
         if nb % 5 == 0:
             print(f"[dit-tok] {nb}/{args.num_batches} batches")
@@ -207,14 +209,23 @@ def main(args):
         except Exception as e:
             print(f"[dit-tok] map figure skipped: {e}")
 
+    # accept at the chosen operating point: per-timestep, accept the top
+    # accept_ratio fraction of tokens by eps-agreement (mirrors the SR tolerance
+    # knob; gives a controllable accept ratio and visible reject structure).
+    accept_mask = np.zeros(n, dtype=bool)
+    for tv in uniq_t:
+        m = t_id == tv
+        se = merged["s_eps"][m]
+        thr = np.quantile(se, 1.0 - args.accept_ratio)
+        accept_mask[m] = se >= thr
     summary = dict(
         target_model=args.target_model, draft_model=args.draft_model,
         target_params_M=round(count_params(target) / 1e6, 2),
         draft_params_M=round(count_params(draft) / 1e6, 2),
         dataset="CIFAR-10", num_tokens=int(target.num_tokens),
         num_tokens_analyzed=int(n),
-        accept_mean=float((merged["s_eps"] > (1 - args.tol)).mean()),
-        accept_std=float((merged["s_eps"] > (1 - args.tol)).std()),
+        accept_ratio_setpoint=args.accept_ratio,
+        accept_mean=float(accept_mask.mean()),
         mean_agreement=float(merged["s_eps"].mean()),
         aurc_per_timestep=aurc, aurc_pooled=pooled)
     with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
@@ -247,6 +258,9 @@ def get_parser():
     ap.add_argument("--t_max", type=int, default=950)
     ap.add_argument("--beta", type=float, default=10.0)
     ap.add_argument("--tol", type=float, default=0.15)
+    ap.add_argument("--accept_ratio", type=float, default=0.7,
+                    help="operating point: per-timestep fraction of tokens accepted "
+                         "by eps-agreement (controls accept map + accept_mean)")
     ap.add_argument("--n_example_maps", type=int, default=4)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--device", type=str,
