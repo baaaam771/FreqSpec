@@ -86,6 +86,7 @@ def main(args):
     ts_grid = torch.linspace(args.t_min, args.t_max, args.n_timesteps).round().long()
 
     chunks = {k: [] for k in ("d_x0", "s_eps", "tnorm", "wav")}
+    t_ids = []
     example_maps = []
     nb = 0
     for x, y in loader:
@@ -110,6 +111,7 @@ def main(args):
                                                               x_t.shape[-1] // p))
             for k, v in (("d_x0", d_x0), ("s_eps", s_eps), ("tnorm", tnorm), ("wav", wav)):
                 chunks[k].append(v.flatten().cpu().numpy())
+            t_ids.append(np.full(d_x0.numel(), int(tv), dtype=np.int32))
             if len(example_maps) < args.n_example_maps and int(tv) == int(ts_grid[len(ts_grid) // 2]):
                 example_maps.append(dict(
                     t=int(tv),
@@ -122,6 +124,7 @@ def main(args):
             print(f"[dit-tok] {nb}/{args.num_batches} batches")
 
     merged = {k: np.concatenate(v) for k, v in chunks.items()}
+    t_id = np.concatenate(t_ids)
     n = merged["d_x0"].size
     print(f"[dit-tok] {n} tokens total")
 
@@ -135,19 +138,48 @@ def main(args):
     }
     coverages = np.linspace(0.05, 1.0, 40)
     os.makedirs(args.out_dir, exist_ok=True)
-    aurc = {}
+
+    # --- primary metric: per-timestep AURC, risk min-max normalized within each
+    # timestep so noise levels are comparable, then averaged over timesteps.
+    # (Pooling all timesteps is misleading: x0-risk explodes at high t while
+    # eps-disagreement shrinks, so a single pool lets high-t tokens dominate the
+    # ranking even though within any timestep eps-agreement predicts risk
+    # near-perfectly. The sampler decides per step, so per-timestep is the
+    # operationally correct evaluation.)
+    uniq_t = np.unique(t_id)
+
+    def per_t_aurc(conf):
+        vals = []
+        for tv in uniq_t:
+            m = t_id == tv
+            r = risk[m]
+            rs = r.max() - r.min()
+            rn = (r - r.min()) / rs if rs > 1e-12 else np.zeros_like(r)
+            cov, risks = risk_coverage_curve(conf[m], rn, coverages)
+            vals.append(compute_aurc(cov, risks))
+        return float(np.mean(vals)), vals
+
+    aurc, aurc_per_t = {}, {}
+    for name, conf in selectors.items():
+        aurc[name], aurc_per_t[name] = per_t_aurc(conf)
+    aurc["Oracle"], aurc_per_t["Oracle"] = per_t_aurc(-risk)
+
+    # pooled (for reference / to document the artifact)
+    pooled = {}
     for name, conf in selectors.items():
         cov, risks = risk_coverage_curve(conf, risk, coverages)
-        aurc[name] = compute_aurc(cov, risks)
-    # oracle lower bound
+        pooled[name] = compute_aurc(cov, risks)
     cov, risks = risk_coverage_curve(-risk, risk, coverages)
-    aurc["Oracle"] = compute_aurc(cov, risks)
+    pooled["Oracle"] = compute_aurc(cov, risks)
 
     with open(os.path.join(args.out_dir, "token_aurc.csv"), "w", newline="") as f:
-        w = csv.writer(f); w.writerow(["selector", "aurc"])
-        for k, v in aurc.items():
-            w.writerow([k, f"{v:.6f}"])
-    print("[dit-tok] AURC:", "  ".join(f"{k}={v:.5f}" for k, v in aurc.items()))
+        w = csv.writer(f); w.writerow(["selector", "aurc_per_timestep", "aurc_pooled"])
+        for k in aurc:
+            w.writerow([k, f"{aurc[k]:.6f}", f"{pooled[k]:.6f}"])
+    print("[dit-tok] per-timestep AURC (primary):",
+          "  ".join(f"{k}={v:.5f}" for k, v in aurc.items()))
+    print("[dit-tok] pooled AURC (reference) :",
+          "  ".join(f"{k}={v:.5f}" for k, v in pooled.items()))
 
     # accept maps figure
     if example_maps:
@@ -184,7 +216,7 @@ def main(args):
         accept_mean=float((merged["s_eps"] > (1 - args.tol)).mean()),
         accept_std=float((merged["s_eps"] > (1 - args.tol)).std()),
         mean_agreement=float(merged["s_eps"].mean()),
-        aurc=aurc)
+        aurc_per_timestep=aurc, aurc_pooled=pooled)
     with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
     print(f"[dit-tok] wrote {os.path.join(args.out_dir, 'summary.json')}")
