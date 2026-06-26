@@ -53,9 +53,27 @@ def load_dit(path, model_name, args, dev):
 
 def get_loader(args):
     from torchvision import datasets, transforms
-    tf = transforms.Compose([transforms.ToTensor(),
-                             transforms.Normalize([0.5] * 3, [0.5] * 3)])
-    ds = datasets.CIFAR10(args.data_root, train=False, download=True, transform=tf)
+    if args.dataset == "imagefolder":
+        import glob
+        from PIL import Image
+        paths = []
+        for e in ("png", "jpg", "jpeg"):
+            paths += glob.glob(os.path.join(args.data_root, "**", f"*.{e}"), recursive=True)
+        paths = sorted(paths)
+        tf = transforms.Compose([transforms.RandomCrop(args.img_size, pad_if_needed=True),
+                                 transforms.ToTensor(),
+                                 transforms.Normalize([0.5] * 3, [0.5] * 3)])
+
+        class ImgDS(torch.utils.data.Dataset):
+            def __len__(self): return len(paths)
+            def __getitem__(self, i):
+                return tf(Image.open(paths[i]).convert("RGB")), 0
+
+        ds = ImgDS()
+    else:
+        tf = transforms.Compose([transforms.ToTensor(),
+                                 transforms.Normalize([0.5] * 3, [0.5] * 3)])
+        ds = datasets.CIFAR10(args.data_root, train=False, download=True, transform=tf)
     return torch.utils.data.DataLoader(ds, batch_size=args.batch, shuffle=True,
                                        num_workers=args.workers, drop_last=True)
 
@@ -85,7 +103,7 @@ def main(args):
     loader = get_loader(args)
     ts_grid = torch.linspace(args.t_min, args.t_max, args.n_timesteps).round().long()
 
-    chunks = {k: [] for k in ("d_x0", "s_eps", "tnorm", "wav")}
+    chunks = {k: [] for k in ("d_x0", "s_eps", "scos", "tnorm", "wav")}
     t_ids = []
     example_maps = []
     nb = 0
@@ -106,10 +124,16 @@ def main(args):
             deps2 = token_pool(eps_d - eps_t, p)                 # [B,1,h,w]
             s_eps = torch.exp(-args.beta * deps2)
             d_x0 = token_pool(x0_d - x0_t, p)
+            # direction-only agreement: per-token mean cosine between draft/target eps
+            dot = F.avg_pool2d((eps_d * eps_t).sum(1, keepdim=True), p, stride=p)
+            nd = F.avg_pool2d(eps_d.pow(2).sum(1, keepdim=True), p, stride=p).sqrt()
+            nt = F.avg_pool2d(eps_t.pow(2).sum(1, keepdim=True), p, stride=p).sqrt()
+            scos = dot / (nd * nt + 1e-8)                        # [-1,1], higher=agree
             tnorm = token_pool(x0_t, p)                          # target content magnitude
             wav = lwd_wavelet_saliency(x_t, dwt, target_size=(x_t.shape[-2] // p,
                                                               x_t.shape[-1] // p))
-            for k, v in (("d_x0", d_x0), ("s_eps", s_eps), ("tnorm", tnorm), ("wav", wav)):
+            for k, v in (("d_x0", d_x0), ("s_eps", s_eps), ("scos", scos),
+                         ("tnorm", tnorm), ("wav", wav)):
                 chunks[k].append(v.flatten().cpu().numpy())
             t_ids.append(np.full(d_x0.numel(), int(tv), dtype=np.int32))
             if len(example_maps) < args.n_example_maps and int(tv) == int(ts_grid[len(ts_grid) // 2]):
@@ -135,6 +159,7 @@ def main(args):
     selectors = {
         "Random":            rng.random(n),
         "Eps agreement":     merged["s_eps"],
+        "Eps-cosine":        merged["scos"],
         "Token-norm":        1.0 - _norm(merged["tnorm"]),
         "Frequency-token":   1.0 - _norm(merged["wav"]),
     }
@@ -247,6 +272,8 @@ def get_parser():
     ap.add_argument("--target_model", type=str, default="DiT-S")
     ap.add_argument("--draft_model", type=str, default="DiT-Ti")
     ap.add_argument("--data_root", type=str, default="./data")
+    ap.add_argument("--dataset", type=str, default="cifar10",
+                    choices=["cifar10", "imagefolder"])
     ap.add_argument("--out_dir", type=str, default="results/dit_token_poc_v0")
     ap.add_argument("--img_size", type=int, default=32)
     ap.add_argument("--patch", type=int, default=4)

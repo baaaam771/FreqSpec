@@ -25,10 +25,31 @@ from training.scheduler import DDPMSchedule
 
 def get_loader(args):
     from torchvision import datasets, transforms
-    tf = transforms.Compose([transforms.RandomHorizontalFlip(),
-                             transforms.ToTensor(),
-                             transforms.Normalize([0.5] * 3, [0.5] * 3)])
-    ds = datasets.CIFAR10(args.data_root, train=True, download=True, transform=tf)
+    if args.dataset == "imagefolder":
+        import glob
+        from PIL import Image
+        paths = []
+        for e in ("png", "jpg", "jpeg"):
+            paths += glob.glob(os.path.join(args.data_root, "**", f"*.{e}"), recursive=True)
+        paths = sorted(paths)
+        if not paths:
+            raise FileNotFoundError(f"no images under {args.data_root}")
+        tf = transforms.Compose([transforms.RandomCrop(args.img_size, pad_if_needed=True),
+                                 transforms.RandomHorizontalFlip(),
+                                 transforms.ToTensor(),
+                                 transforms.Normalize([0.5] * 3, [0.5] * 3)])
+
+        class ImgDS(torch.utils.data.Dataset):
+            def __len__(self): return len(paths)
+            def __getitem__(self, i):
+                return tf(Image.open(paths[i]).convert("RGB")), 0  # single class
+
+        ds = ImgDS()
+    else:
+        tf = transforms.Compose([transforms.RandomHorizontalFlip(),
+                                 transforms.ToTensor(),
+                                 transforms.Normalize([0.5] * 3, [0.5] * 3)])
+        ds = datasets.CIFAR10(args.data_root, train=True, download=True, transform=tf)
     return torch.utils.data.DataLoader(ds, batch_size=args.batch, shuffle=True,
                                        num_workers=args.workers, drop_last=True,
                                        pin_memory=True)
@@ -109,6 +130,9 @@ def get_parser():
     p.add_argument("--distill_from", type=str, default="")
     p.add_argument("--distill_weight", type=float, default=1.0)
     p.add_argument("--data_root", type=str, default="./data")
+    p.add_argument("--dataset", type=str, default="cifar10",
+                   choices=["cifar10", "imagefolder"],
+                   help="imagefolder = random-crop images under data_root (e.g. DIV2K 64x64)")
     p.add_argument("--out", type=str, default="./ckpt_dit/model.pt")
     p.add_argument("--img_size", type=int, default=32)
     p.add_argument("--patch", type=int, default=4)
