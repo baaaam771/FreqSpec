@@ -23,28 +23,36 @@ from models.dit import build_dit, count_params
 from training.scheduler import DDPMSchedule
 
 
+class _ImageFolderDS(torch.utils.data.Dataset):
+    """Top-level (picklable) random-crop image dataset; single dummy class 0."""
+    def __init__(self, paths, img_size, train=True):
+        from torchvision import transforms
+        self.paths = paths
+        ops = [transforms.RandomCrop(img_size, pad_if_needed=True)]
+        if train:
+            ops.append(transforms.RandomHorizontalFlip())
+        ops += [transforms.ToTensor(), transforms.Normalize([0.5] * 3, [0.5] * 3)]
+        self.tf = transforms.Compose(ops)
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, i):
+        from PIL import Image
+        return self.tf(Image.open(self.paths[i]).convert("RGB")), 0
+
+
 def get_loader(args):
     from torchvision import datasets, transforms
     if args.dataset == "imagefolder":
         import glob
-        from PIL import Image
         paths = []
         for e in ("png", "jpg", "jpeg"):
             paths += glob.glob(os.path.join(args.data_root, "**", f"*.{e}"), recursive=True)
         paths = sorted(paths)
         if not paths:
             raise FileNotFoundError(f"no images under {args.data_root}")
-        tf = transforms.Compose([transforms.RandomCrop(args.img_size, pad_if_needed=True),
-                                 transforms.RandomHorizontalFlip(),
-                                 transforms.ToTensor(),
-                                 transforms.Normalize([0.5] * 3, [0.5] * 3)])
-
-        class ImgDS(torch.utils.data.Dataset):
-            def __len__(self): return len(paths)
-            def __getitem__(self, i):
-                return tf(Image.open(paths[i]).convert("RGB")), 0  # single class
-
-        ds = ImgDS()
+        ds = _ImageFolderDS(paths, args.img_size, train=True)
     else:
         tf = transforms.Compose([transforms.RandomHorizontalFlip(),
                                  transforms.ToTensor(),
