@@ -44,7 +44,16 @@ class _ImageFolderDS(torch.utils.data.Dataset):
 
 def get_loader(args):
     from torchvision import datasets, transforms
-    if args.dataset == "imagefolder":
+    if args.dataset == "imagenet":
+        # class-conditional: data_root has one subdirectory per class
+        tf = transforms.Compose([transforms.Resize(args.img_size),
+                                 transforms.CenterCrop(args.img_size),
+                                 transforms.RandomHorizontalFlip(),
+                                 transforms.ToTensor(),
+                                 transforms.Normalize([0.5] * 3, [0.5] * 3)])
+        ds = datasets.ImageFolder(args.data_root, transform=tf)
+        print(f"[dit] ImageFolder: {len(ds)} images, {len(ds.classes)} classes")
+    elif args.dataset == "imagefolder":
         import glob
         paths = []
         for e in ("png", "jpg", "jpeg"):
@@ -139,7 +148,7 @@ def get_parser():
     p.add_argument("--distill_weight", type=float, default=1.0)
     p.add_argument("--data_root", type=str, default="./data")
     p.add_argument("--dataset", type=str, default="cifar10",
-                   choices=["cifar10", "imagefolder"],
+                   choices=["cifar10", "imagefolder", "imagenet"],
                    help="imagefolder = random-crop images under data_root (e.g. DIV2K 64x64)")
     p.add_argument("--out", type=str, default="./ckpt_dit/model.pt")
     p.add_argument("--img_size", type=int, default=32)

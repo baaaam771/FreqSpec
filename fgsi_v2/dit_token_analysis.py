@@ -72,7 +72,13 @@ def load_dit(path, model_name, args, dev):
 
 def get_loader(args):
     from torchvision import datasets, transforms
-    if args.dataset == "imagefolder":
+    if args.dataset == "imagenet":
+        tf = transforms.Compose([transforms.Resize(args.img_size),
+                                 transforms.CenterCrop(args.img_size),
+                                 transforms.ToTensor(),
+                                 transforms.Normalize([0.5] * 3, [0.5] * 3)])
+        ds = datasets.ImageFolder(args.data_root, transform=tf)
+    elif args.dataset == "imagefolder":
         import glob
         paths = []
         for e in ("png", "jpg", "jpeg"):
@@ -284,7 +290,7 @@ def get_parser():
     ap.add_argument("--draft_model", type=str, default="DiT-Ti")
     ap.add_argument("--data_root", type=str, default="./data")
     ap.add_argument("--dataset", type=str, default="cifar10",
-                    choices=["cifar10", "imagefolder"])
+                    choices=["cifar10", "imagefolder", "imagenet"])
     ap.add_argument("--out_dir", type=str, default="results/dit_token_poc_v0")
     ap.add_argument("--img_size", type=int, default=32)
     ap.add_argument("--patch", type=int, default=4)

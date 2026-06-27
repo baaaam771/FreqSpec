@@ -140,6 +140,7 @@ class DiT(nn.Module):
 
 
 CONFIGS = {
+    "DiT-B":    dict(dim=768, depth=12, heads=12),  # larger target (~130M at patch 4)
     "DiT-S":    dict(dim=384, depth=12, heads=6),
     "DiT-Ti":   dict(dim=192, depth=6,  heads=3),
     "DiT-Nano": dict(dim=128, depth=4,  heads=4),
