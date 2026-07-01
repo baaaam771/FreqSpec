@@ -40,13 +40,16 @@ def gen_method(method, target, draft, sch, ts, args, dev, out_dir):
     if len(existing) >= args.n_samples and not args.force_regen:
         print(f"[fid] {method}: found {len(existing)} existing samples, skip generation")
         return -1.0  # accept unknown when reusing; not needed for FID
+    # seed per (method) so runs are reproducible and comparable across selectors
+    torch.manual_seed(args.seed)          # random selector uses global RNG
+    g = torch.Generator(device=dev).manual_seed(args.seed)
     n_done = 0
     idx = 0
     accs = []
     while n_done < args.n_samples:
         b = min(args.batch, args.n_samples - n_done)
-        y = torch.randint(0, args.num_classes, (b,), device=dev)
-        z = torch.randn(b, 3, args.img_size, args.img_size, device=dev)
+        y = torch.randint(0, args.num_classes, (b,), device=dev, generator=g)
+        z = torch.randn(b, 3, args.img_size, args.img_size, device=dev, generator=g)
         x, accept = sample(method, target, draft, sch, ts, y, z, args, dev)
         accs.append(float(accept))
         x = ((x.clamp(-1, 1) + 1) / 2)
@@ -124,6 +127,8 @@ def get_parser():
     ap.add_argument("--workers", type=int, default=0,
                     help="clean-fid dataloader workers; keep 0 on Python 3.14 "
                          "(forkserver cannot pickle clean-fid's resizer)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="RNG seed for class labels, initial noise, and random selector")
     ap.add_argument("--force_regen", action="store_true",
                     help="regenerate samples even if the folder already has enough")
     ap.add_argument("--device", type=str,
