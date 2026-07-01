@@ -36,6 +36,10 @@ from dit_token_sampler import load_dit, sample
 @torch.no_grad()
 def gen_method(method, target, draft, sch, ts, args, dev, out_dir):
     os.makedirs(out_dir, exist_ok=True)
+    existing = [f for f in os.listdir(out_dir) if f.endswith(".png")]
+    if len(existing) >= args.n_samples and not args.force_regen:
+        print(f"[fid] {method}: found {len(existing)} existing samples, skip generation")
+        return -1.0  # accept unknown when reusing; not needed for FID
     n_done = 0
     idx = 0
     accs = []
@@ -74,6 +78,9 @@ def main(args):
     for m in methods:
         gdir = os.path.join(args.out_dir, f"samples_{m}")
         acc = gen_method(m, target, draft, sch, ts, args, dev, gdir)
+        if acc < 0:  # samples reused; use setpoint as accept estimate
+            acc = args.accept_ratio if m in ("freqspec", "random") else \
+                  (1.0 if m == "draft" else 0.0)
         score = cfid.compute_fid(gdir, args.ref_dir, mode="clean",
                                  num_workers=args.workers)
         tgt_use = (1.0 - acc) if m in ("freqspec", "random") else \
@@ -113,7 +120,11 @@ def get_parser():
     ap.add_argument("--accept_ratio", type=float, default=0.5)
     ap.add_argument("--beta", type=float, default=10.0)
     ap.add_argument("--methods", type=str, default="target,draft,freqspec,random")
-    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--workers", type=int, default=0,
+                    help="clean-fid dataloader workers; keep 0 on Python 3.14 "
+                         "(forkserver cannot pickle clean-fid's resizer)")
+    ap.add_argument("--force_regen", action="store_true",
+                    help="regenerate samples even if the folder already has enough")
     ap.add_argument("--device", type=str,
                     default="cuda" if torch.cuda.is_available() else "cpu")
     return ap
