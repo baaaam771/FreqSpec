@@ -83,7 +83,8 @@ def main(args):
                   (1.0 if m == "draft" else 0.0)
         score = cfid.compute_fid(gdir, args.ref_dir, mode="clean",
                                  num_workers=args.workers)
-        tgt_use = (1.0 - acc) if m in ("freqspec", "random") else \
+        mix = ("freqspec", "eps_l2", "eps_cosine", "token_norm", "frequency", "random")
+        tgt_use = (1.0 - acc) if m in mix else \
                   (0.0 if m == "draft" else 1.0)
         results[m] = dict(fid=round(float(score), 3),
                           accept=round(acc, 4),

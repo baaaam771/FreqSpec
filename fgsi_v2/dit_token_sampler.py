@@ -52,6 +52,30 @@ def token_agreement(eps_d, eps_t, p, beta):
     return torch.exp(-beta * deps2)
 
 
+def token_score(selector, eps_d, eps_t, z, p, beta, dwt=None):
+    """Per-token acceptance score (higher = more likely to accept the draft),
+    shape [B,1,h,w]. Mirrors the reliability selectors so the FID ablation uses
+    the same signals as the AURC analysis."""
+    if selector in ("freqspec", "eps_l2"):
+        return token_agreement(eps_d, eps_t, p, beta)
+    if selector == "eps_cosine":
+        dot = F.avg_pool2d((eps_d * eps_t).sum(1, keepdim=True), p, stride=p)
+        nd = F.avg_pool2d(eps_d.pow(2).sum(1, keepdim=True), p, stride=p).sqrt()
+        nt = F.avg_pool2d(eps_t.pow(2).sum(1, keepdim=True), p, stride=p).sqrt()
+        return dot / (nd * nt + 1e-8)                       # [-1,1], higher = agree
+    if selector == "token_norm":
+        # lower target content magnitude -> accept draft (matches 1 - norm ranking)
+        tnorm = F.avg_pool2d(eps_t.pow(2).mean(1, keepdim=True), p, stride=p)
+        return -tnorm
+    if selector == "frequency":
+        # lower wavelet high-frequency saliency -> accept draft
+        from models.wavelet import lwd_wavelet_saliency
+        wav = lwd_wavelet_saliency(z, dwt, target_size=(z.shape[-2] // p,
+                                                        z.shape[-1] // p))
+        return -wav
+    raise ValueError(f"unknown selector {selector}")
+
+
 def upsample_mask(mask_tok, p):
     return mask_tok.repeat_interleave(p, dim=2).repeat_interleave(p, dim=3)
 
@@ -69,6 +93,11 @@ def accept_topk(s_tok, ratio):
 def sample(method, target, draft, sch, ts, y, z, args, dev):
     p, B = args.patch, y.shape[0]
     acc_sum, steps = 0.0, 0
+    dwt = None
+    if method == "frequency":
+        from models.wavelet import DWT2D
+        dwt = DWT2D("haar").to(dev)
+    mix_selectors = ("freqspec", "eps_l2", "eps_cosine", "token_norm", "frequency")
     for i, t in enumerate(ts):
         t_prev = int(ts[i + 1]) if i + 1 < len(ts) else -1
         tt = torch.full((B,), int(t), device=dev, dtype=torch.long)
@@ -79,17 +108,17 @@ def sample(method, target, draft, sch, ts, y, z, args, dev):
         else:
             eps_t = target(z, tt, y)
             eps_d = draft(z, tt, y)
-            if method == "freqspec":
-                s_tok = token_agreement(eps_d, eps_t, p, args.beta)
-                acc = accept_topk(s_tok, args.accept_ratio).float()
-            else:  # random
+            if method == "random":
                 acc = (torch.rand(B, 1, z.shape[-2] // p, z.shape[-1] // p, device=dev)
                        < args.accept_ratio).float()
+            else:  # any score-based selector
+                s_tok = token_score(method, eps_d, eps_t, z, p, args.beta, dwt)
+                acc = accept_topk(s_tok, args.accept_ratio).float()
             acc_full = upsample_mask(acc, p)
             eps = acc_full * eps_d + (1 - acc_full) * eps_t
             acc_sum += acc.mean().item(); steps += 1
         z, _ = sch.ddim_step(z, eps, int(t), t_prev, eta=0.0)
-    accept = acc_sum / max(steps, 1) if method in ("freqspec", "random") else \
+    accept = acc_sum / max(steps, 1) if method in mix_selectors + ("random",) else \
         (1.0 if method == "draft" else 0.0)
     return z, accept
 
