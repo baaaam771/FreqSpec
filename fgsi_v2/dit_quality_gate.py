@@ -56,7 +56,8 @@ def save_grid(x, path, nrow=8):
 def main(a):
     dev = a.device
     os.makedirs(a.out_dir, exist_ok=True)
-    sch = DDPMSchedule(device=dev)
+    sch = DDPMSchedule(num_train_timesteps=1000, beta_start=1e-4, beta_end=0.02,
+                       beta_schedule="linear", device=dev)
     report = {}
 
     tgt = load_dit(a.target, a.target_model, a, dev)
