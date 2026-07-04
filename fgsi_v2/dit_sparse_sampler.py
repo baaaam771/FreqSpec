@@ -99,6 +99,8 @@ def select_hard(selector, args, ctx):
         score = d
     elif selector == "router":
         score = ctx["router"](ctx["h_d"].float(), ctx["scal"].float(), tt)
+    elif selector == "anchor":
+        score = ctx["anchor_score"]        # d_i measured at the last anchor
     elif selector == "random":
         score = torch.rand(B, N, device=z.device)
     elif selector == "frequency":
@@ -126,7 +128,7 @@ def sample_sparse(target, draft, sch, ts, y, z, args, dev, router=None):
         dwt = DWT2D("haar").to(dev)
 
     n_warm, n_anchor = 0, 0
-    cache, since_anchor = None, 10**9
+    cache, since_anchor, anchor_score = None, 10**9, None
     for i, t in enumerate(ts):
         t_prev = int(ts[i + 1]) if i + 1 < len(ts) else -1
         tt = torch.full((y.shape[0],), int(t), device=dev, dtype=torch.long)
@@ -149,12 +151,20 @@ def sample_sparse(target, draft, sch, ts, y, z, args, dev, router=None):
 
         # cache-mode anchor step: dense target + cache refresh, no draft
         if (sel not in ("dense", "draft", "mix") and mode == "cache_attn"
-                and (cache is None or since_anchor >= args.cache_period - 1)):
+                and (cache is None or since_anchor >= args.cache_period - 1
+                     or (sel == "anchor" and anchor_score is None))):
             n_anchor += 1
             tm.start()
             eps, cache = dit_forward_dense_with_cache(target, z, tt, y, m)
             since_anchor = 0
             tm.stop("target_anchor")
+            if sel == "anchor":            # measure exact d_i while both are cheap
+                tm.start()
+                eps_da = draft(z, tt, y)
+                anchor_score = F.avg_pool2d(
+                    (eps_da - eps).pow(2).mean(1, keepdim=True),
+                    p, stride=p).flatten(1)
+                tm.stop("draft")
             tm.start(); z, _ = sch.ddim_step(z, eps, int(t), t_prev, eta=0.0)
             tm.stop("scheduler")
             continue
@@ -174,7 +184,8 @@ def sample_sparse(target, draft, sch, ts, y, z, args, dev, router=None):
             hf = hf.repeat_interleave(p, 2).repeat_interleave(p, 3)
             eps = hf * eps_t + (1 - hf) * eps_d
         else:
-            ctx = dict(z=z, tt=tt, router=router, dwt=dwt)
+            ctx = dict(z=z, tt=tt, router=router, dwt=dwt,
+                       anchor_score=anchor_score)
             tm.start()
             if sel == "router":
                 eps_d, h_d = dit_forward_tokens(draft, z, tt, y)
@@ -222,6 +233,8 @@ def flops_summary(target, draft, args, steps, n_warm=0, n_anchor=0):
                                                refresh_every=args.refresh_every)
         total = ((n_warm + n_anchor) * f_dense
                  + (steps - n_warm - n_anchor) * per_sparse)
+        if sel == "anchor":
+            total += n_anchor * f_draft    # d_i measurement at anchors
     return dict(target_dense_gmac=round(f_dense / 1e9, 4),
                 draft_gmac=round(f_draft / 1e9, 4),
                 per_step_gmac=round(total / steps / 1e9, 4),
@@ -316,7 +329,7 @@ def get_parser():
     ap.add_argument("--out_dir", type=str, required=True)
     ap.add_argument("--selector", type=str, default="oracle",
                     choices=["dense", "draft", "mix", "oracle", "router",
-                             "random", "frequency", "norm"])
+                             "random", "frequency", "norm", "anchor"])
     ap.add_argument("--suffix_mode", type=str, default="sparse_mlp",
                     choices=["dense", "sparse_mlp", "sparse_attn", "cache_attn"])
     ap.add_argument("--hard_ratio", type=float, default=0.3,
