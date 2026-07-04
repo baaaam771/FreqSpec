@@ -36,7 +36,9 @@ class TimestepEmbedder(nn.Module):
         emb = torch.cat([torch.cos(a), torch.sin(a)], dim=-1)
         if self.freq_dim % 2:
             emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
-        return self.mlp(emb)
+        # sinusoidal emb is built in fp32; match the MLP weight dtype so the
+        # model can be cast to bf16/fp16 for benchmarking (no-op in fp32)
+        return self.mlp(emb.to(self.mlp[0].weight.dtype))
 
 
 class LabelEmbedder(nn.Module):
