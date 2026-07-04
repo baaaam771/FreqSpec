@@ -17,7 +17,7 @@ import json
 import os
 
 COLS = ["selector", "suffix_mode", "split", "hard_ratio",
-        "refresh_every", "dense_until",
+        "refresh_every", "dense_until", "cache_period",
         "per_step_vs_dense", "total_gmac", "fid",
         "wall_per_image_s", "draft_ms", "select_ms", "sparse_ms", "dense_ms"]
 
@@ -35,6 +35,7 @@ def main(args):
             split=s["split"], hard_ratio=s["hard_ratio"],
             refresh_every=s.get("refresh_every", 0),
             dense_until=s.get("dense_until", 1.0),
+            cache_period=s.get("cache_period", ""),
             per_step_vs_dense=s["flops"]["per_step_vs_dense"],
             total_gmac=s["flops"]["total_gmac"],
             fid=s.get("fid", ""),
@@ -61,7 +62,8 @@ def main(args):
     print(f"[assemble] {len(rows)} runs -> {out_csv}, {out_md}")
     for r in rows:
         print(f"  {r['selector']:9s} {r['suffix_mode']:11s} "
-              f"m={r['split']} r={r['hard_ratio']} "
+              f"m={r['split']} r={r['hard_ratio']} re={r['refresh_every']} "
+              f"w={r['dense_until']} cp={r['cache_period']} "
               f"mac={r['per_step_vs_dense']} fid={r['fid']}")
 
 

@@ -161,6 +161,61 @@ def sparse_target_eps(model, x, t, y, idx, m, mode, eps_canvas,
     return model.unpatchify(canvas, hw)
 
 
+# ------------------------------------------------- temporal cache (Stage 13)
+def dit_forward_dense_with_cache(model, x, t, y, m):
+    """Dense forward that also records the INPUT hidden states of every suffix
+    block (blocks m..L-1). These are depth-correct states reused for easy
+    tokens at subsequent sparse steps (temporal staleness <= cache period,
+    instead of the depth-mismatched frozen states that Stage A2 showed to
+    fail). Returns (eps, cache list of length L-m, each [B,N,D])."""
+    tok, hw = model.x_embed(x)
+    tok = tok + model.pos
+    c = model.t_embed(t) + model.y_embed(y, False)
+    cache = []
+    for j, blk in enumerate(model.blocks):
+        if j >= m:
+            cache.append(tok)
+        tok = blk(tok, c)
+    out = model.final(tok, c)
+    return model.unpatchify(out, hw), cache
+
+
+def dit_forward_suffix_cached(model, tok_m, c, idx, m, cache):
+    """Sparse suffix where easy-token context comes from the anchor-step cache
+    (depth-correct, time-stale) instead of being frozen at depth m.
+
+    tok_m : fresh prefix output of THIS step [B,N,D] (block-m input)
+    cache : list from dit_forward_dense_with_cache (anchor step)
+
+    Per block j: context = fresh hard states scattered into cached easy states
+    (block m uses this step's fresh states for everyone — they exist for free);
+    hard tokens are the only queries and the only MLP rows. Returns hard-token
+    FinalLayer outputs [B,k,p*p*C]."""
+    x_hard = gather_tokens(tok_m, idx)
+    for j, blk in enumerate(model.blocks[m:]):
+        base = tok_m if j == 0 else cache[j]
+        ctx = scatter_tokens(base, idx, x_hard)
+        sh_msa, sc_msa, g_msa, sh_mlp, sc_mlp, g_mlp = blk.ada(c).chunk(6, dim=1)
+        h = modulate(blk.norm1(ctx), sh_msa, sc_msa)
+        q = gather_tokens(h, idx)
+        x_hard = x_hard + g_msa.unsqueeze(1) * blk.attn(q, h, h,
+                                                        need_weights=False)[0]
+        h2 = modulate(blk.norm2(x_hard), sh_mlp, sc_mlp)
+        x_hard = x_hard + g_mlp.unsqueeze(1) * blk.mlp(h2)
+    shift, scale = model.final.ada(c).chunk(2, dim=1)
+    return model.final.lin(modulate(model.final.norm(x_hard), shift, scale))
+
+
+def sparse_target_eps_cached(model, x, t, y, idx, m, eps_canvas, cache):
+    """Cache-context sparse target pass: dense prefix + cached sparse suffix,
+    hard outputs scattered into eps_canvas (draft prediction)."""
+    tok, c, hw = dit_forward_prefix(model, x, t, y, m)
+    out_h = dit_forward_suffix_cached(model, tok, c, idx, m, cache)
+    canvas = patchify_img(eps_canvas, model.patch)
+    canvas = scatter_tokens(canvas, idx, out_h)
+    return model.unpatchify(canvas, hw)
+
+
 # ------------------------------------------------------------ FLOPs accounting
 def dit_block_flops(N, D, k=None, mode="dense", mlp_ratio=4.0):
     """Multiply-accumulate count for one DiT block (per image).

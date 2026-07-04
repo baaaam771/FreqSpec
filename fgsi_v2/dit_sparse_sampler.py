@@ -57,6 +57,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from models.dit import count_params
 from models.dit_sparse import (dit_forward_tokens, sparse_target_eps,
+                               sparse_target_eps_cached,
+                               dit_forward_dense_with_cache,
                                dit_model_flops, topk_index)
 from models.token_router import token_scalar_feats, build_router_from_ckpt
 from training.scheduler import DDPMSchedule
@@ -123,7 +125,8 @@ def sample_sparse(target, draft, sch, ts, y, z, args, dev, router=None):
         from models.wavelet import DWT2D
         dwt = DWT2D("haar").to(dev)
 
-    n_warm = 0
+    n_warm, n_anchor = 0, 0
+    cache, since_anchor = None, 10**9
     for i, t in enumerate(ts):
         t_prev = int(ts[i + 1]) if i + 1 < len(ts) else -1
         tt = torch.full((y.shape[0],), int(t), device=dev, dtype=torch.long)
@@ -133,7 +136,25 @@ def sample_sparse(target, draft, sch, ts, y, z, args, dev, router=None):
                 and (int(t) / sch.num_train_timesteps) > args.dense_until)
         if warm:
             n_warm += 1
-            tm.start(); eps = target(z, tt, y); tm.stop("target_dense")
+            tm.start()
+            if mode == "cache_attn":
+                eps, cache = dit_forward_dense_with_cache(target, z, tt, y, m)
+                since_anchor = 0
+            else:
+                eps = target(z, tt, y)
+            tm.stop("target_dense")
+            tm.start(); z, _ = sch.ddim_step(z, eps, int(t), t_prev, eta=0.0)
+            tm.stop("scheduler")
+            continue
+
+        # cache-mode anchor step: dense target + cache refresh, no draft
+        if (sel not in ("dense", "draft", "mix") and mode == "cache_attn"
+                and (cache is None or since_anchor >= args.cache_period - 1)):
+            n_anchor += 1
+            tm.start()
+            eps, cache = dit_forward_dense_with_cache(target, z, tt, y, m)
+            since_anchor = 0
+            tm.stop("target_anchor")
             tm.start(); z, _ = sch.ddim_step(z, eps, int(t), t_prev, eta=0.0)
             tm.stop("scheduler")
             continue
@@ -168,15 +189,20 @@ def sample_sparse(target, draft, sch, ts, y, z, args, dev, router=None):
                 tm.stop("oracle_dense_target")  # diagnostic-only cost
             tm.start(); idx = select_hard(sel, args, ctx); tm.stop("select")
             tm.start()
-            eps = sparse_target_eps(target, z, tt, y, idx, m, mode, eps_d,
-                                    args.refresh_every)
+            if mode == "cache_attn":
+                eps = sparse_target_eps_cached(target, z, tt, y, idx, m,
+                                               eps_d, cache)
+                since_anchor += 1
+            else:
+                eps = sparse_target_eps(target, z, tt, y, idx, m, mode, eps_d,
+                                        args.refresh_every)
             tm.stop("target_sparse")
         tm.start(); z, _ = sch.ddim_step(z, eps, int(t), t_prev, eta=0.0)
         tm.stop("scheduler")
-    return z, tm.acc, n_warm
+    return z, tm.acc, n_warm, n_anchor
 
 
-def flops_summary(target, draft, args, steps, n_warm=0):
+def flops_summary(target, draft, args, steps, n_warm=0, n_anchor=0):
     L = len(target.blocks)
     m = max(0, min(L - 1, int(round(args.split * L))))
     k = max(1, int(round(args.hard_ratio * target.num_tokens)))
@@ -190,17 +216,19 @@ def flops_summary(target, draft, args, steps, n_warm=0):
     elif sel == "mix":
         total = (f_dense + f_draft) * steps
     else:
-        per_sparse = f_draft + dit_model_flops(target, args.suffix_mode, m=m,
-                                               k=k,
+        smode = ("sparse_attn" if args.suffix_mode == "cache_attn"
+                 else args.suffix_mode)   # cached suffix = sparse_attn ops
+        per_sparse = f_draft + dit_model_flops(target, smode, m=m, k=k,
                                                refresh_every=args.refresh_every)
-        total = n_warm * f_dense + (steps - n_warm) * per_sparse
+        total = ((n_warm + n_anchor) * f_dense
+                 + (steps - n_warm - n_anchor) * per_sparse)
     return dict(target_dense_gmac=round(f_dense / 1e9, 4),
                 draft_gmac=round(f_draft / 1e9, 4),
                 per_step_gmac=round(total / steps / 1e9, 4),
                 per_step_vs_dense=round(total / (f_dense * steps), 4),
                 total_gmac=round(total / 1e9, 3),
                 split_m=m, hard_k=k, warm_steps=n_warm,
-                refresh_every=args.refresh_every)
+                anchor_steps=n_anchor, refresh_every=args.refresh_every)
 
 
 @torch.no_grad()
@@ -234,7 +262,7 @@ def main(args):
         b = min(args.batch, args.n_samples - n_done)
         y = torch.randint(0, args.num_classes, (b,), device=dev, generator=g)
         z = torch.randn(b, 3, args.img_size, args.img_size, device=dev, generator=g)
-        x, tacc, n_warm = sample_sparse(target, draft, sch, ts, y, z, args, dev, router)
+        x, tacc, n_warm, n_anchor = sample_sparse(target, draft, sch, ts, y, z, args, dev, router)
         for k, v in tacc.items():
             timing_total[k] = timing_total.get(k, 0.0) + v
         if dump_dir:
@@ -252,11 +280,12 @@ def main(args):
     if xs:
         save_grid(torch.cat(xs)[:64], os.path.join(args.out_dir, "grid.png"))
 
-    fl = flops_summary(target, draft, args, args.steps, n_warm)
+    fl = flops_summary(target, draft, args, args.steps, n_warm, n_anchor)
     per_img_ms = {k: round(v / args.n_samples, 2) for k, v in timing_total.items()}
     summary = dict(selector=args.selector, suffix_mode=args.suffix_mode,
                    hard_ratio=args.hard_ratio, split=args.split,
                    refresh_every=args.refresh_every, dense_until=args.dense_until,
+                   cache_period=args.cache_period,
                    steps=args.steps, n_samples=args.n_samples,
                    flops=fl, per_image_ms=per_img_ms,
                    wall_s=round(wall, 2),
@@ -289,7 +318,7 @@ def get_parser():
                     choices=["dense", "draft", "mix", "oracle", "router",
                              "random", "frequency", "norm"])
     ap.add_argument("--suffix_mode", type=str, default="sparse_mlp",
-                    choices=["dense", "sparse_mlp", "sparse_attn"])
+                    choices=["dense", "sparse_mlp", "sparse_attn", "cache_attn"])
     ap.add_argument("--hard_ratio", type=float, default=0.3,
                     help="fraction of tokens executed by the target suffix")
     ap.add_argument("--split", type=float, default=0.5,
@@ -297,6 +326,10 @@ def get_parser():
     ap.add_argument("--refresh_every", type=int, default=0,
                     help="run every s-th suffix block densely (0 = off); "
                          "bounds easy-token staleness")
+    ap.add_argument("--cache_period", type=int, default=5,
+                    help="cache_attn: dense anchor every this many steps; "
+                         "easy-token suffix context is reused from the last "
+                         "anchor (depth-correct, time-stale)")
     ap.add_argument("--dense_until", type=float, default=1.0,
                     help="run the dense target while t/T is above this value "
                          "(phase warm-up; 1.0 = off, 0.7 = FreqSpec-style)")
