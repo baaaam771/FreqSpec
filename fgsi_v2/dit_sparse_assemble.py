@@ -17,6 +17,7 @@ import json
 import os
 
 COLS = ["selector", "suffix_mode", "split", "hard_ratio",
+        "refresh_every", "dense_until",
         "per_step_vs_dense", "total_gmac", "fid",
         "wall_per_image_s", "draft_ms", "select_ms", "sparse_ms", "dense_ms"]
 
@@ -32,6 +33,8 @@ def main(args):
         rows.append(dict(
             selector=s["selector"], suffix_mode=s["suffix_mode"],
             split=s["split"], hard_ratio=s["hard_ratio"],
+            refresh_every=s.get("refresh_every", 0),
+            dense_until=s.get("dense_until", 1.0),
             per_step_vs_dense=s["flops"]["per_step_vs_dense"],
             total_gmac=s["flops"]["total_gmac"],
             fid=s.get("fid", ""),

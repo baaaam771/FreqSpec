@@ -120,20 +120,26 @@ def _block_sparse_attn(blk, x, c, idx):
     return scatter_tokens(x, idx, xh)
 
 
-def dit_forward_suffix_sparse(model, tok, c, hw, idx, m, mode="sparse_mlp"):
+def dit_forward_suffix_sparse(model, tok, c, hw, idx, m, mode="sparse_mlp",
+                              refresh_every=0):
     """Run blocks m..L-1 sparsely, then FinalLayer on hard tokens only.
+    refresh_every=s > 0 runs every s-th suffix block DENSELY (all tokens),
+    bounding easy-token staleness: stale-but-valid context degrades with
+    suffix depth, and a periodic dense refresh resets it (Stage-A finding:
+    identity easy handling loses most of the budget advantage without this).
     Returns hard-token outputs [B, k, p*p*C] (caller scatters into a draft
     canvas)."""
     blocks = model.blocks[m:]
     if mode == "dense":
         for blk in blocks:
             tok = blk(tok, c)
-    elif mode == "sparse_mlp":
-        for blk in blocks:
-            tok = _block_sparse_mlp(blk, tok, c, idx)
-    elif mode == "sparse_attn":
-        for blk in blocks:
-            tok = _block_sparse_attn(blk, tok, c, idx)
+    elif mode in ("sparse_mlp", "sparse_attn"):
+        step_fn = _block_sparse_mlp if mode == "sparse_mlp" else _block_sparse_attn
+        for i, blk in enumerate(blocks):
+            if refresh_every and (i + 1) % refresh_every == 0:
+                tok = blk(tok, c)                               # dense refresh
+            else:
+                tok = step_fn(blk, tok, c, idx)
     else:
         raise ValueError(f"unknown suffix mode {mode}")
     tok_h = gather_tokens(tok, idx)
@@ -142,12 +148,14 @@ def dit_forward_suffix_sparse(model, tok, c, hw, idx, m, mode="sparse_mlp"):
     return model.final.lin(modulate(model.final.norm(tok_h), shift, scale))
 
 
-def sparse_target_eps(model, x, t, y, idx, m, mode, eps_canvas):
+def sparse_target_eps(model, x, t, y, idx, m, mode, eps_canvas,
+                      refresh_every=0):
     """Full sparse target pass: dense prefix (blocks 0..m-1) + sparse suffix
     (blocks m..L-1) + hard-only FinalLayer, scattered into `eps_canvas`
     (typically the draft prediction, [B,C,H,W]). Returns mixed eps [B,C,H,W]."""
     tok, c, hw = dit_forward_prefix(model, x, t, y, m)
-    out_h = dit_forward_suffix_sparse(model, tok, c, hw, idx, m, mode)
+    out_h = dit_forward_suffix_sparse(model, tok, c, hw, idx, m, mode,
+                                      refresh_every)
     canvas = patchify_img(eps_canvas, model.patch)              # [B,N,p*p*C]
     canvas = scatter_tokens(canvas, idx, out_h)
     return model.unpatchify(canvas, hw)
@@ -171,7 +179,7 @@ def dit_block_flops(N, D, k=None, mode="dense", mlp_ratio=4.0):
     raise ValueError(mode)
 
 
-def dit_model_flops(model, mode="dense", m=None, k=None):
+def dit_model_flops(model, mode="dense", m=None, k=None, refresh_every=0):
     """Total block+final MAC count per image for a (possibly sparse) forward."""
     N, D, L = model.num_tokens, model.pos.shape[-1], len(model.blocks)
     p, C = model.patch, model.out_ch
@@ -179,8 +187,11 @@ def dit_model_flops(model, mode="dense", m=None, k=None):
     fl = fin_tokens * D * (p * p * C)                    # FinalLayer linear
     if mode == "dense" or m is None:
         return L * dit_block_flops(N, D, mode="dense") + N * D * (p * p * C)
+    n_suffix = L - m
+    n_refresh = (n_suffix // refresh_every) if refresh_every else 0
     fl_prefix = m * dit_block_flops(N, D, mode="dense")
-    fl_suffix = (L - m) * dit_block_flops(N, D, k=k, mode=mode)
+    fl_suffix = ((n_suffix - n_refresh) * dit_block_flops(N, D, k=k, mode=mode)
+                 + n_refresh * dit_block_flops(N, D, mode="dense"))
     return fl_prefix + fl_suffix + fl
 
 
