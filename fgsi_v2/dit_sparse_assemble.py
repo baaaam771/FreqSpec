@@ -17,7 +17,7 @@ import json
 import os
 
 COLS = ["selector", "suffix_mode", "split", "hard_ratio",
-        "refresh_every", "dense_until", "cache_period",
+        "refresh_every", "dense_until", "cache_period", "steps", "total_rel",
         "per_step_vs_dense", "total_gmac", "fid",
         "wall_per_image_s", "draft_ms", "select_ms", "sparse_ms", "dense_ms"]
 
@@ -36,6 +36,9 @@ def main(args):
             refresh_every=s.get("refresh_every", 0),
             dense_until=s.get("dense_until", 1.0),
             cache_period=s.get("cache_period", ""),
+            steps=s.get("steps", 50),
+            total_rel=round(s["flops"]["total_gmac"]
+                            / (s["flops"]["target_dense_gmac"] * 50), 4),
             per_step_vs_dense=s["flops"]["per_step_vs_dense"],
             total_gmac=s["flops"]["total_gmac"],
             fid=s.get("fid", ""),
@@ -63,8 +66,8 @@ def main(args):
     for r in rows:
         print(f"  {r['selector']:9s} {r['suffix_mode']:11s} "
               f"m={r['split']} r={r['hard_ratio']} re={r['refresh_every']} "
-              f"w={r['dense_until']} cp={r['cache_period']} "
-              f"mac={r['per_step_vs_dense']} fid={r['fid']}")
+              f"cp={r['cache_period']} s={r['steps']} "
+              f"TOTAL={r['total_rel']} fid={r['fid']}")
 
 
 if __name__ == "__main__":
