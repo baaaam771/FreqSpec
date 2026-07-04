@@ -101,6 +101,8 @@ def select_hard(selector, args, ctx):
         score = ctx["router"](ctx["h_d"].float(), ctx["scal"].float(), tt)
     elif selector == "anchor":
         score = ctx["anchor_score"]        # d_i measured at the last anchor
+    elif selector == "delta":
+        score = ctx["delta_score"]         # anchor-to-anchor target-eps change
     elif selector == "random":
         score = torch.rand(B, N, device=z.device)
     elif selector == "frequency":
@@ -128,7 +130,10 @@ def sample_sparse(target, draft, sch, ts, y, z, args, dev, router=None):
         dwt = DWT2D("haar").to(dev)
 
     n_warm, n_anchor = 0, 0
+    cnt = dict(target_dense=0, target_sparse=0, draft=0, oracle_diag=0)
     cache, since_anchor, anchor_score = None, 10**9, None
+    eps_cache, prev_anchor_eps, delta_score = None, None, None
+    reuse = (args.easy_source == "target_cache")
     for i, t in enumerate(ts):
         t_prev = int(ts[i + 1]) if i + 1 < len(ts) else -1
         tt = torch.full((y.shape[0],), int(t), device=dev, dtype=torch.long)
@@ -139,9 +144,16 @@ def sample_sparse(target, draft, sch, ts, y, z, args, dev, router=None):
         if warm:
             n_warm += 1
             tm.start()
+            cnt["target_dense"] += 1
             if mode == "cache_attn":
                 eps, cache = dit_forward_dense_with_cache(target, z, tt, y, m)
                 since_anchor = 0
+                if reuse:
+                    if eps_cache is not None:
+                        delta_score = F.avg_pool2d(
+                            (eps - eps_cache).pow(2).mean(1, keepdim=True),
+                            p, stride=p).flatten(1)
+                    eps_cache = eps
             else:
                 eps = target(z, tt, y)
             tm.stop("target_dense")
@@ -152,14 +164,23 @@ def sample_sparse(target, draft, sch, ts, y, z, args, dev, router=None):
         # cache-mode anchor step: dense target + cache refresh, no draft
         if (sel not in ("dense", "draft", "mix") and mode == "cache_attn"
                 and (cache is None or since_anchor >= args.cache_period - 1
-                     or (sel == "anchor" and anchor_score is None))):
+                     or (sel == "anchor" and anchor_score is None)
+                     or (sel == "delta" and delta_score is None))):
             n_anchor += 1
+            cnt["target_dense"] += 1
             tm.start()
             eps, cache = dit_forward_dense_with_cache(target, z, tt, y, m)
             since_anchor = 0
             tm.stop("target_anchor")
+            if reuse or sel == "delta":
+                if eps_cache is not None:  # hardness = anchor-to-anchor change
+                    delta_score = F.avg_pool2d(
+                        (eps - eps_cache).pow(2).mean(1, keepdim=True),
+                        p, stride=p).flatten(1)
+                eps_cache = eps
             if sel == "anchor":            # measure exact d_i while both are cheap
                 tm.start()
+                cnt["draft"] += 1
                 eps_da = draft(z, tt, y)
                 anchor_score = F.avg_pool2d(
                     (eps_da - eps).pow(2).mean(1, keepdim=True),
@@ -170,10 +191,13 @@ def sample_sparse(target, draft, sch, ts, y, z, args, dev, router=None):
             continue
 
         if sel == "dense":
+            cnt["target_dense"] += 1
             tm.start(); eps = target(z, tt, y); tm.stop("target_dense")
         elif sel == "draft":
+            cnt["draft"] += 1
             tm.start(); eps = draft(z, tt, y); tm.stop("draft")
         elif sel == "mix":  # paper's K=1 output mixing (dense both)
+            cnt["target_dense"] += 1; cnt["draft"] += 1
             tm.start(); eps_t = target(z, tt, y); tm.stop("target_dense")
             tm.start(); eps_d = draft(z, tt, y); tm.stop("draft")
             d = F.avg_pool2d((eps_d - eps_t).pow(2).mean(1, keepdim=True),
@@ -185,63 +209,68 @@ def sample_sparse(target, draft, sch, ts, y, z, args, dev, router=None):
             eps = hf * eps_t + (1 - hf) * eps_d
         else:
             ctx = dict(z=z, tt=tt, router=router, dwt=dwt,
-                       anchor_score=anchor_score)
-            tm.start()
-            if sel == "router":
-                eps_d, h_d = dit_forward_tokens(draft, z, tt, y)
-                ctx["h_d"] = h_d
-                ctx["scal"] = token_scalar_feats(eps_d, p, token_grid(z, p))
-            else:
-                eps_d = draft(z, tt, y)
-            ctx["eps_d"] = eps_d
-            tm.stop("draft")
+                       anchor_score=anchor_score, delta_score=delta_score)
+            need_draft = (sel in ("router", "norm")
+                          or (not reuse))          # draft supplies easy outputs
+            eps_d = None
+            if need_draft:
+                tm.start()
+                cnt["draft"] += 1
+                if sel == "router":
+                    eps_d, h_d = dit_forward_tokens(draft, z, tt, y)
+                    ctx["h_d"] = h_d
+                    ctx["scal"] = token_scalar_feats(eps_d, p, token_grid(z, p))
+                else:
+                    eps_d = draft(z, tt, y)
+                ctx["eps_d"] = eps_d
+                tm.stop("draft")
             if sel == "oracle":
-                tm.start(); ctx["eps_t_dense"] = target(z, tt, y)
-                tm.stop("oracle_dense_target")  # diagnostic-only cost
+                tm.start(); cnt["oracle_diag"] += 1
+                ctx["eps_t_dense"] = target(z, tt, y)
+                if reuse:                     # oracle risk vs the reused eps
+                    ctx["eps_d"] = eps_cache
+                tm.stop("oracle_dense_target")  # upper-bound-only cost
             tm.start(); idx = select_hard(sel, args, ctx); tm.stop("select")
+            canvas = eps_cache if reuse else eps_d
             tm.start()
+            cnt["target_sparse"] += 1
             if mode == "cache_attn":
                 eps = sparse_target_eps_cached(target, z, tt, y, idx, m,
-                                               eps_d, cache)
+                                               canvas, cache)
                 since_anchor += 1
             else:
-                eps = sparse_target_eps(target, z, tt, y, idx, m, mode, eps_d,
-                                        args.refresh_every)
+                eps = sparse_target_eps(target, z, tt, y, idx, m, mode,
+                                        canvas, args.refresh_every)
             tm.stop("target_sparse")
         tm.start(); z, _ = sch.ddim_step(z, eps, int(t), t_prev, eta=0.0)
         tm.stop("scheduler")
-    return z, tm.acc, n_warm, n_anchor
+    return z, tm.acc, n_warm, n_anchor, cnt
 
 
-def flops_summary(target, draft, args, steps, n_warm=0, n_anchor=0):
+def flops_summary(target, draft, args, steps, cnt):
+    """Exact MAC accounting from counted forward passes. Deployable total
+    excludes oracle diagnostic passes; they are reported separately so table
+    captions can state the exclusion (oracle = selection upper bound)."""
     L = len(target.blocks)
     m = max(0, min(L - 1, int(round(args.split * L))))
     k = max(1, int(round(args.hard_ratio * target.num_tokens)))
     f_dense = dit_model_flops(target, "dense")
     f_draft = dit_model_flops(draft, "dense")
-    sel = args.selector
-    if sel == "dense":
-        total = f_dense * steps
-    elif sel == "draft":
-        total = f_draft * steps
-    elif sel == "mix":
-        total = (f_dense + f_draft) * steps
-    else:
-        smode = ("sparse_attn" if args.suffix_mode == "cache_attn"
-                 else args.suffix_mode)   # cached suffix = sparse_attn ops
-        per_sparse = f_draft + dit_model_flops(target, smode, m=m, k=k,
-                                               refresh_every=args.refresh_every)
-        total = ((n_warm + n_anchor) * f_dense
-                 + (steps - n_warm - n_anchor) * per_sparse)
-        if sel == "anchor":
-            total += n_anchor * f_draft    # d_i measurement at anchors
+    smode = ("sparse_attn" if args.suffix_mode == "cache_attn"
+             else args.suffix_mode)        # cached suffix = sparse_attn ops
+    f_sparse = dit_model_flops(target, smode, m=m, k=k,
+                               refresh_every=args.refresh_every)
+    total = (cnt["target_dense"] * f_dense + cnt["target_sparse"] * f_sparse
+             + cnt["draft"] * f_draft)
     return dict(target_dense_gmac=round(f_dense / 1e9, 4),
                 draft_gmac=round(f_draft / 1e9, 4),
                 per_step_gmac=round(total / steps / 1e9, 4),
                 per_step_vs_dense=round(total / (f_dense * steps), 4),
                 total_gmac=round(total / 1e9, 3),
-                split_m=m, hard_k=k, warm_steps=n_warm,
-                anchor_steps=n_anchor, refresh_every=args.refresh_every)
+                oracle_diag_gmac=round(cnt["oracle_diag"] * f_dense / 1e9, 3),
+                calls=dict(cnt),
+                split_m=m, hard_k=k,
+                refresh_every=args.refresh_every)
 
 
 @torch.no_grad()
@@ -254,6 +283,11 @@ def main(args):
     router = build_router_from_ckpt(args.router, dev) if args.router else None
     if args.selector == "router" and router is None:
         raise ValueError("--selector router requires --router <ckpt>")
+    if (args.easy_source == "target_cache" or args.selector == "delta") \
+            and args.suffix_mode != "cache_attn" \
+            and args.selector not in ("dense", "draft", "mix"):
+        raise ValueError("--easy_source target_cache / --selector delta "
+                         "require --suffix_mode cache_attn")
     print(f"[sparse] target {args.target_model} {count_params(target)/1e6:.1f}M | "
           f"draft {args.draft_model} {count_params(draft)/1e6:.1f}M | "
           f"selector={args.selector} suffix={args.suffix_mode} "
@@ -275,7 +309,7 @@ def main(args):
         b = min(args.batch, args.n_samples - n_done)
         y = torch.randint(0, args.num_classes, (b,), device=dev, generator=g)
         z = torch.randn(b, 3, args.img_size, args.img_size, device=dev, generator=g)
-        x, tacc, n_warm, n_anchor = sample_sparse(target, draft, sch, ts, y, z, args, dev, router)
+        x, tacc, n_warm, n_anchor, cnt = sample_sparse(target, draft, sch, ts, y, z, args, dev, router)
         for k, v in tacc.items():
             timing_total[k] = timing_total.get(k, 0.0) + v
         if dump_dir:
@@ -293,12 +327,13 @@ def main(args):
     if xs:
         save_grid(torch.cat(xs)[:64], os.path.join(args.out_dir, "grid.png"))
 
-    fl = flops_summary(target, draft, args, args.steps, n_warm, n_anchor)
+    fl = flops_summary(target, draft, args, args.steps, cnt)
     per_img_ms = {k: round(v / args.n_samples, 2) for k, v in timing_total.items()}
     summary = dict(selector=args.selector, suffix_mode=args.suffix_mode,
                    hard_ratio=args.hard_ratio, split=args.split,
                    refresh_every=args.refresh_every, dense_until=args.dense_until,
                    cache_period=args.cache_period,
+                   easy_source=args.easy_source,
                    steps=args.steps, n_samples=args.n_samples,
                    flops=fl, per_image_ms=per_img_ms,
                    wall_s=round(wall, 2),
@@ -329,7 +364,8 @@ def get_parser():
     ap.add_argument("--out_dir", type=str, required=True)
     ap.add_argument("--selector", type=str, default="oracle",
                     choices=["dense", "draft", "mix", "oracle", "router",
-                             "random", "frequency", "norm", "anchor"])
+                             "random", "frequency", "norm", "anchor",
+                             "delta"])
     ap.add_argument("--suffix_mode", type=str, default="sparse_mlp",
                     choices=["dense", "sparse_mlp", "sparse_attn", "cache_attn"])
     ap.add_argument("--hard_ratio", type=float, default=0.3,
@@ -339,6 +375,11 @@ def get_parser():
     ap.add_argument("--refresh_every", type=int, default=0,
                     help="run every s-th suffix block densely (0 = off); "
                          "bounds easy-token staleness")
+    ap.add_argument("--easy_source", type=str, default="draft",
+                    choices=["draft", "target_cache"],
+                    help="easy-token eps source: the draft prediction, or the "
+                         "target's own eps from the last anchor (draft-free "
+                         "token-wise step allocation; cache_attn only)")
     ap.add_argument("--cache_period", type=int, default=5,
                     help="cache_attn: dense anchor every this many steps; "
                          "easy-token suffix context is reused from the last "
