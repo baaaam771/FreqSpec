@@ -103,6 +103,14 @@ def select_hard(selector, args, ctx):
         score = ctx["anchor_score"]        # d_i measured at the last anchor
     elif selector == "delta":
         score = ctx["delta_score"]         # anchor-to-anchor target-eps change
+    elif selector == "rotate":
+        # round-robin coverage: strided token groups refreshed in turn,
+        # guaranteeing every token is refreshed within ceil(1/r) sparse steps
+        n_grp = max(1, int(round(1.0 / max(args.hard_ratio, 1e-6))))
+        grp = ctx["sparse_step_idx"] % n_grp
+        idx_all = torch.arange(N, device=z.device)
+        score = (idx_all % n_grp == grp).float().unsqueeze(0).expand(B, -1) \
+                + 1e-3 * torch.rand(B, N, device=z.device)   # tie-break fill
     elif selector == "random":
         score = torch.rand(B, N, device=z.device)
     elif selector == "frequency":
@@ -133,6 +141,7 @@ def sample_sparse(target, draft, sch, ts, y, z, args, dev, router=None):
     cnt = dict(target_dense=0, target_sparse=0, draft=0, oracle_diag=0)
     cache, since_anchor, anchor_score = None, 10**9, None
     eps_cache, prev_anchor_eps, delta_score = None, None, None
+    sparse_step_idx = 0
     reuse = (args.easy_source == "target_cache")
     for i, t in enumerate(ts):
         t_prev = int(ts[i + 1]) if i + 1 < len(ts) else -1
@@ -165,7 +174,8 @@ def sample_sparse(target, draft, sch, ts, y, z, args, dev, router=None):
         if (sel not in ("dense", "draft", "mix") and mode == "cache_attn"
                 and (cache is None or since_anchor >= args.cache_period - 1
                      or (sel == "anchor" and anchor_score is None)
-                     or (sel == "delta" and delta_score is None))):
+                     or (sel == "delta" and delta_score is None
+                         and args.hard_ratio > 0))):
             n_anchor += 1
             cnt["target_dense"] += 1
             tm.start()
@@ -208,8 +218,17 @@ def sample_sparse(target, draft, sch, ts, y, z, args, dev, router=None):
             hf = hf.repeat_interleave(p, 2).repeat_interleave(p, 3)
             eps = hf * eps_t + (1 - hf) * eps_d
         else:
+            # r=0: pure temporal caching -- easy source covers ALL tokens,
+            # no correction, no target/draft call at this step
+            if reuse and args.hard_ratio <= 0:
+                tm.start(); eps = eps_cache; since_anchor += 1
+                sparse_step_idx += 1; tm.stop("reuse")
+                tm.start(); z, _ = sch.ddim_step(z, eps, int(t), t_prev, eta=0.0)
+                tm.stop("scheduler")
+                continue
             ctx = dict(z=z, tt=tt, router=router, dwt=dwt,
-                       anchor_score=anchor_score, delta_score=delta_score)
+                       anchor_score=anchor_score, delta_score=delta_score,
+                       sparse_step_idx=sparse_step_idx)
             need_draft = (sel in ("router", "norm")
                           or (not reuse))          # draft supplies easy outputs
             eps_d = None
@@ -242,6 +261,7 @@ def sample_sparse(target, draft, sch, ts, y, z, args, dev, router=None):
                 eps = sparse_target_eps(target, z, tt, y, idx, m, mode,
                                         canvas, args.refresh_every)
             tm.stop("target_sparse")
+            sparse_step_idx += 1
         tm.start(); z, _ = sch.ddim_step(z, eps, int(t), t_prev, eta=0.0)
         tm.stop("scheduler")
     return z, tm.acc, n_warm, n_anchor, cnt
@@ -253,12 +273,13 @@ def flops_summary(target, draft, args, steps, cnt):
     captions can state the exclusion (oracle = selection upper bound)."""
     L = len(target.blocks)
     m = max(0, min(L - 1, int(round(args.split * L))))
-    k = max(1, int(round(args.hard_ratio * target.num_tokens)))
+    k = (0 if args.hard_ratio <= 0
+         else max(1, int(round(args.hard_ratio * target.num_tokens))))
     f_dense = dit_model_flops(target, "dense")
     f_draft = dit_model_flops(draft, "dense")
     smode = ("sparse_attn" if args.suffix_mode == "cache_attn"
              else args.suffix_mode)        # cached suffix = sparse_attn ops
-    f_sparse = dit_model_flops(target, smode, m=m, k=k,
+    f_sparse = dit_model_flops(target, smode, m=m, k=max(k, 1),
                                refresh_every=args.refresh_every)
     total = (cnt["target_dense"] * f_dense + cnt["target_sparse"] * f_sparse
              + cnt["draft"] * f_draft)
@@ -283,11 +304,16 @@ def main(args):
     router = build_router_from_ckpt(args.router, dev) if args.router else None
     if args.selector == "router" and router is None:
         raise ValueError("--selector router requires --router <ckpt>")
-    if (args.easy_source == "target_cache" or args.selector == "delta") \
+    if (args.easy_source == "target_cache"
+            or args.selector in ("delta", "rotate")) \
             and args.suffix_mode != "cache_attn" \
             and args.selector not in ("dense", "draft", "mix"):
-        raise ValueError("--easy_source target_cache / --selector delta "
+        raise ValueError("--easy_source target_cache / --selector delta/rotate "
                          "require --suffix_mode cache_attn")
+    if args.hard_ratio <= 0 and args.easy_source != "target_cache" \
+            and args.selector not in ("dense", "draft", "mix"):
+        raise ValueError("--hard_ratio 0 (pure temporal caching) requires "
+                         "--easy_source target_cache")
     print(f"[sparse] target {args.target_model} {count_params(target)/1e6:.1f}M | "
           f"draft {args.draft_model} {count_params(draft)/1e6:.1f}M | "
           f"selector={args.selector} suffix={args.suffix_mode} "
@@ -365,7 +391,7 @@ def get_parser():
     ap.add_argument("--selector", type=str, default="oracle",
                     choices=["dense", "draft", "mix", "oracle", "router",
                              "random", "frequency", "norm", "anchor",
-                             "delta"])
+                             "delta", "rotate"])
     ap.add_argument("--suffix_mode", type=str, default="sparse_mlp",
                     choices=["dense", "sparse_mlp", "sparse_attn", "cache_attn"])
     ap.add_argument("--hard_ratio", type=float, default=0.3,

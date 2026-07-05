@@ -58,7 +58,9 @@ def main(args):
     g = torch.Generator(device=dev).manual_seed(args.seed)
 
     per_step = {k: [[] for _ in ts] for k in ("cv", "p90_p50", "topr_share",
-                                              "neigh_corr")}
+                                              "neigh_corr", "mean_abs",
+                                              "mean_rel", "block2_share",
+                                              "block4_share")}
     n_done = 0
     while n_done < args.n_traj:
         b = min(args.batch, args.n_traj - n_done)
@@ -85,6 +87,22 @@ def main(args):
                 top = d.topk(k, dim=1).values.sum(1)
                 per_step["topr_share"][i].extend(
                     (top / (d.sum(1) + 1e-12)).tolist())
+                # absolute magnitude of temporal change, and relative to the
+                # prediction's own energy at this step (scale-free)
+                eps_energy = F.avg_pool2d(eps.pow(2).mean(1, keepdim=True),
+                                          p, stride=p).flatten(1).mean(1)
+                per_step["mean_abs"][i].extend(mean.tolist())
+                per_step["mean_rel"][i].extend(
+                    (mean / (eps_energy + 1e-12)).tolist())
+                # block-capture: fraction of total change captured by
+                # block-level top-k at the same budget (2x2 and 4x4 blocks)
+                for bs, key in ((2, "block2_share"), (4, "block4_share")):
+                    db = F.avg_pool2d(d2, bs, stride=bs).flatten(1)  # [B,Nb]
+                    nb = db.shape[1]
+                    kb = max(1, int(round(args.topr * nb)))
+                    top_b = db.topk(kb, dim=1).values.sum(1) * (bs * bs)
+                    per_step[key][i].extend(
+                        (top_b / (d.sum(1) + 1e-12)).tolist())
                 # neighbor correlation on the token grid (spatial structure)
                 dm = d2 - d2.mean(dim=(2, 3), keepdim=True)
                 right = (dm[..., :, :-1] * dm[..., :, 1:]).mean(dim=(1, 2, 3))
@@ -114,18 +132,25 @@ def main(args):
           f"top-{args.topr:g} share={out['metrics']['topr_share']['pooled']} "
           f"(uniform baseline={args.topr:g}) "
           f"neigh corr={out['metrics']['neigh_corr']['pooled']}")
+    print(f"[hetero] mean |d-eps|^2 abs={out['metrics']['mean_abs']['pooled']} "
+          f"rel={out['metrics']['mean_rel']['pooled']} | block-capture at "
+          f"top-{args.topr:g}: 2x2={out['metrics']['block2_share']['pooled']} "
+          f"4x4={out['metrics']['block4_share']['pooled']} "
+          f"(token-level={out['metrics']['topr_share']['pooled']})")
 
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        fig, axes = plt.subplots(1, 3, figsize=(12, 3.4))
+        fig, axes = plt.subplots(1, 4, figsize=(15, 3.2))
         steps_ax = list(range(1, args.steps))
         for ax, key, lbl, base in (
-                (axes[0], "cv", "across-token CV of temporal eps change", None),
-                (axes[1], "topr_share",
+                (axes[0], "mean_rel",
+                 "mean temporal change / eps energy (magnitude)", None),
+                (axes[1], "cv", "across-token CV of temporal eps change", None),
+                (axes[2], "topr_share",
                  f"top-{args.topr:g} token share of total change", args.topr),
-                (axes[2], "neigh_corr", "neighbor correlation", 0.0)):
+                (axes[3], "neigh_corr", "neighbor correlation", 0.0)):
             vals = [np.mean(v) for v in per_step[key] if v]
             ax.plot(steps_ax[:len(vals)], vals, lw=2)
             if base is not None:
