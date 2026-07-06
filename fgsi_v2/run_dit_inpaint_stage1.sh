@@ -8,8 +8,6 @@ set -e
 export TMPDIR=/mnt/HDD_12TB/bam_ki/tmp
 
 ROOT=/mnt/HDD_12TB/bam_ki
-# DATA_TR=$ROOT/imagenet64/train
-# DATA_VA=$ROOT/imagenet64/val
 DATA_TR=$ROOT/datasets/imagenet64/train
 DATA_VA=$ROOT/datasets/imagenet64/val
 CKPT=$ROOT/ckpt_dit_inp

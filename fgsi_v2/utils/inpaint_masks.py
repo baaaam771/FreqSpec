@@ -98,8 +98,19 @@ def erode_tokens(tok_map, k=1):
 
 
 def boundary_band(tok_bin, k=1):
-    """Morphological gradient on the token grid: dilate - erode."""
+    """Morphological gradient on the TOKEN grid: dilate(k) - erode(k).
+    review item 4: this k is the SELECTION boundary width
+    (selection_boundary_k) and is kept separate from the EXECUTION mask
+    dilation (execution_mask_dilate) so the two roles do not overlap."""
     return (dilate_tokens(tok_bin, k) - erode_tokens(tok_bin, k)).clamp(0, 1)
+
+
+def pixel_boundary_ring(mask_px, ring=6):
+    """Pixel-space boundary ring around the hole edge for boundary-LPIPS:
+    dilate(mask, ring) - erode(mask, ring), in {0,1} [B,1,H,W]."""
+    d = F.max_pool2d(mask_px, 2 * ring + 1, stride=1, padding=ring)
+    e = 1.0 - F.max_pool2d(1.0 - mask_px, 2 * ring + 1, stride=1, padding=ring)
+    return (d - e).clamp(0, 1)
 
 
 def rank_normalize(score_flat):
@@ -135,17 +146,22 @@ def block_round_indices(idx, h, w, block=2):
     count over the batch; shorter rows are padded by repeating their last
     index, which is harmless for gather/scatter). Structured sparsity for
     GPU-friendly execution — inpainting masks are contiguous so the budget
-    overhead is small."""
+    overhead is small.
+
+    NOTE (review item 6): this is *block-structured selection*, not a
+    block-sparse kernel. Execution still uses rectangular gather/scatter, so
+    the padded k' is what runs; the true per-sample block-covered count is
+    returned separately for MAC accounting. A real block-sparse speed-up
+    needs a fused grouped kernel."""
     B, k = idx.shape
     dev = idx.device
     covered = torch.zeros(B, h * w, dtype=torch.bool, device=dev)
     covered.scatter_(1, idx, True)
     cov = covered.view(B, 1, h, w).float()
-    # mark whole block if any member is hard
     cov = F.max_pool2d(cov, block, stride=block)
     cov = F.interpolate(cov, scale_factor=block, mode="nearest")
     cov = cov.view(B, h * w) > 0.5
-    counts = cov.sum(1)
+    counts = cov.sum(1)                                   # true per-sample k
     kk = int(counts.max().item())
     out = torch.zeros(B, kk, dtype=torch.long, device=dev)
     for i in range(B):
@@ -153,7 +169,56 @@ def block_round_indices(idx, h, w, block=2):
         out[i, :ci.numel()] = ci
         if ci.numel() < kk:
             out[i, ci.numel():] = ci[-1]
-    return torch.sort(out, dim=1).values
+    return torch.sort(out, dim=1).values, counts
+
+
+def exact_set_indices(eligible_bin):
+    """review item 3 — EXACT per-sample budget. Given a per-sample binary
+    eligibility map [B,N] (e.g. dilated hole tokens), return
+        idx    : [B, kmax] padded index tensor (padding = repeats of a real
+                 in-set index, harmless for gather/scatter — no extra token is
+                 ever refreshed)
+        counts : [B] true per-sample |set|  (used for MAC accounting)
+    Every sample refreshes EXACTLY its own eligible set, so a small mask is
+    not forced to borrow tokens from outside its hole (the bug in the old
+    batch-max auto budget)."""
+    B, N = eligible_bin.shape
+    dev = eligible_bin.device
+    e = eligible_bin > 0.5
+    counts = e.sum(1).clamp(min=1)
+    kmax = int(counts.max().item())
+    out = torch.zeros(B, kmax, dtype=torch.long, device=dev)
+    for i in range(B):
+        ci = torch.nonzero(e[i], as_tuple=False).squeeze(1)
+        if ci.numel() == 0:                              # empty mask guard
+            ci = torch.tensor([0], device=dev)
+        out[i, :ci.numel()] = ci
+        if ci.numel() < kmax:
+            out[i, ci.numel():] = ci[-1]
+    return torch.sort(out, dim=1).values, counts
+
+
+def topk_within(score, eligible_bin, ratio_of_set):
+    """Fixed-ratio budget CONFINED to an eligible set, per sample. k_b =
+    ceil(ratio_of_set * |set_b|); score outside the set is set to -inf so the
+    top-k stays inside. Returns padded idx [B,kmax] + true counts [B]. Used
+    for the within-mask ranking ablations (mask+boundary+freq+delta), where a
+    ratio < 1 exposes whether the ranking inside the hole matters."""
+    B, N = score.shape
+    dev = score.device
+    e = eligible_bin > 0.5
+    s = score.masked_fill(~e, float("-inf"))
+    set_sz = e.sum(1).clamp(min=1)
+    counts = (ratio_of_set * set_sz.float()).ceil().long().clamp(min=1)
+    kmax = int(counts.max().item())
+    order = s.argsort(dim=1, descending=True)            # [B,N]
+    out = order[:, :kmax].contiguous()
+    # pad rows whose k_b < kmax by repeating their last valid pick
+    for i in range(B):
+        kb = int(counts[i].item())
+        if kb < kmax:
+            out[i, kb:] = out[i, kb - 1]
+    return torch.sort(out, dim=1).values, counts
 
 
 def known_latent(x0, eps0, sqrt_ac, sqrt_1mac, t):
@@ -174,5 +239,7 @@ if __name__ == "__main__":
     print("token map", tok.shape, "boundary tokens per img",
           bnd.flatten(1).sum(1).tolist())
     idx = torch.topk(tok.flatten(1), 20, dim=1).indices
-    br = block_round_indices(idx, 16, 16, block=2)
-    print("block-rounded k:", br.shape)
+    br, cnt = block_round_indices(idx, 16, 16, block=2)
+    print("block-rounded k:", br.shape, "true counts", cnt.tolist())
+    ex, exc = exact_set_indices((tok.flatten(1) > 0.5).float())
+    print("exact mask idx:", ex.shape, "true counts", exc.tolist())

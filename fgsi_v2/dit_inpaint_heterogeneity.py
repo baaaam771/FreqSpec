@@ -30,7 +30,7 @@ Outputs (JSON + npz):
 Usage:
     python dit_inpaint_heterogeneity.py \
         --target ckpt_dit_inp/target.pt --target_model DiT-S-Inp \
-        --data_root /path/imagenet64/val --n_traj 64 \
+        --data_root /mnt/HDD_12TB/bam_ki/datasets/datasets/imagenet64/val --n_traj 64 \
         --out results/dit_inp/heterogeneity
 """
 import argparse
@@ -48,7 +48,8 @@ from models.dit_inpaint import DiTInpaint, load_dit_inpaint
 from training.scheduler import DDPMSchedule
 from utils.inpaint_masks import (sample_masks, mask_to_tokens, dilate_tokens,
                                  known_latent)
-from dit_inpaint_sampler import get_val_loader, per_token_sq, masked_psnr
+from dit_inpaint_sampler import get_val_loader, per_token_sq
+from utils.inpaint_metrics import region_psnr
 
 
 @torch.no_grad()
@@ -161,7 +162,7 @@ def main(args):
             m = mask
             mse_t += (((x_out - x_ref) ** 2 * m).flatten(1).sum(1)
                       / (m.flatten(1).sum(1) * 3 + 1e-8)).mean().item()
-            psnr += masked_psnr(x_out, x0, m)
+            psnr += region_psnr(x_out, x0, m).mean().item()
             nb += 1
         sens[S] = dict(mask_mse_t=mse_t / nb, mask_psnr=psnr / nb)
         print(f"[sens] S={S}: mask_mse_t={sens[S]['mask_mse_t']:.5f} "
