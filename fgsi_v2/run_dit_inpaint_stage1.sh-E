@@ -20,7 +20,7 @@ mkdir -p $CKPT $RES
 #    완료됐으면 "already at/after target steps" 출력 후 즉시 통과.
 python -u -m training.train_dit_inpaint --model DiT-S-Inp \
     --data_root $DATA_TR --dataset imagenet \
-    --out $CKPT/target.pt --steps 300000 --batch 256 --workers 20 --prefetch_factor 6 \
+    --out $CKPT/target.pt --steps 300000 --batch 256 --workers 8 \
     --save_every 5000 --milestone_every 50000
 
 # 2) draft DiT-Nano-Inp, region-aware distilled — draft_nano.pt 없으면 새로,
@@ -28,7 +28,7 @@ python -u -m training.train_dit_inpaint --model DiT-S-Inp \
 python -u -m training.train_dit_inpaint --model DiT-Nano-Inp \
     --data_root $DATA_TR --dataset imagenet \
     --distill_from $CKPT/target.pt --target_model DiT-S-Inp \
-    --out $CKPT/draft_nano.pt --steps 300000 --batch 256 --workers 20 --prefetch_factor 6 \
+    --out $CKPT/draft_nano.pt --steps 300000 --batch 256 --workers 8 \
     --save_every 5000 --milestone_every 50000
 
 # 3) dense step-reduction sweep (완료된 out_dir은 자동 skip)
