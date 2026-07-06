@@ -40,7 +40,47 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.dit_inpaint import build_dit_inpaint, count_params, DiTInpaint
 from training.scheduler import DDPMSchedule
 from utils.inpaint_masks import sample_masks
-from training.train_dit import get_loader, ema_update  # reuse loaders/EMA
+from training.train_dit import ema_update  # reuse EMA helper
+
+
+def _worker_init(_wid):
+    """서로 다른 worker가 다른 seed를 쓰도록."""
+    import random
+    import numpy as np
+    s = torch.initial_seed() % (2 ** 31)
+    np.random.seed(s)
+    random.seed(s)
+
+
+def get_loader_inpaint(args):
+    """Inpainting 학습 전용 loader. train_dit.get_loader와 달리
+    persistent_workers/prefetch_factor를 켜서 HDD의 작은 PNG random I/O
+    병목에서도 GPU가 굶지 않게 한다 (train_dit.py는 공용이라 미변경)."""
+    from torchvision import datasets, transforms
+    if args.dataset in ("imagenet", "imagefolder"):
+        tf = transforms.Compose([transforms.Resize(args.img_size),
+                                 transforms.CenterCrop(args.img_size),
+                                 transforms.RandomHorizontalFlip(),
+                                 transforms.ToTensor(),
+                                 transforms.Normalize([0.5] * 3, [0.5] * 3)])
+        ds = datasets.ImageFolder(args.data_root, transform=tf)
+        print(f"[dit-inp] ImageFolder: {len(ds)} images, "
+              f"{len(ds.classes)} classes", flush=True)
+    else:
+        tf = transforms.Compose([transforms.RandomHorizontalFlip(),
+                                 transforms.ToTensor(),
+                                 transforms.Normalize([0.5] * 3, [0.5] * 3)])
+        ds = datasets.CIFAR10(args.data_root, train=True, download=True,
+                              transform=tf)
+    kw = dict(batch_size=args.batch, shuffle=True, drop_last=True,
+              num_workers=args.workers, pin_memory=True)
+    if args.workers > 0:
+        # persistent_workers: epoch마다 worker 재생성 안 함 (forkserver 비용 제거)
+        # prefetch_factor: worker당 미리 읽어둘 배치 수 → GPU 연산 중 I/O 겹침
+        kw.update(persistent_workers=True,
+                  prefetch_factor=args.prefetch_factor,
+                  worker_init_fn=_worker_init)
+    return torch.utils.data.DataLoader(ds, **kw)
 
 
 def atomic_save(obj, path):
@@ -106,7 +146,7 @@ def main(args):
         p.requires_grad_(False)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
     print(f"[dit-inp] {args.model} params={count_params(model)/1e6:.2f}M "
-          f"tokens={model.num_tokens}")
+          f"tokens={model.num_tokens}", flush=True)
 
     target = None
     if args.distill_from:
@@ -119,9 +159,9 @@ def main(args):
         target.eval()
         for p in target.parameters():
             p.requires_grad_(False)
-        print(f"[dit-inp] region-aware distill from {args.distill_from}")
+        print(f"[dit-inp] region-aware distill from {args.distill_from}", flush=True)
 
-    loader = get_loader(args)
+    loader = get_loader_inpaint(args)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     step = try_resume(model, ema, opt, args, dev)
     if step >= args.steps:
@@ -161,7 +201,7 @@ def main(args):
             ema_update(ema, model, args.ema_decay)
             step += 1
             if step % args.log_every == 0:
-                print(f"[dit-inp] step {step}/{args.steps} loss {loss.item():.4f}")
+                print(f"[dit-inp] step {step}/{args.steps} loss {loss.item():.4f}", flush=True)
             if step % args.save_every == 0 or step >= args.steps:
                 ck = make_ckpt(model, ema, opt, step, args)
                 atomic_save(ck, args.out)                 # canonical
@@ -173,7 +213,7 @@ def main(args):
                 break
     atomic_save(make_ckpt(model, ema, opt, step, args), args.out)
     atomic_save(make_ckpt(model, ema, opt, step, args), args.out + ".last.pt")
-    print(f"[dit-inp] saved {args.out} (step {step})")
+    print(f"[dit-inp] saved {args.out} (step {step})", flush=True)
 
 
 def get_parser():
@@ -206,9 +246,13 @@ def get_parser():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--steps", type=int, default=300000)
     p.add_argument("--ema_decay", type=float, default=0.9999)
-    p.add_argument("--workers", type=int, default=0,
-                   help="Python 3.14 forkserver cannot pickle some datasets; "
-                        "0 is the safe default on the server")
+    p.add_argument("--workers", type=int, default=8,
+                   help="dataloader worker 수. HDD의 작은 PNG random I/O "
+                        "병목에는 4~8 권장. Python 3.14 forkserver에서 pickle "
+                        "에러가 나면 낮추거나 0. 0이면 메인 스레드가 읽어 "
+                        "GPU가 굶을 수 있음")
+    p.add_argument("--prefetch_factor", type=int, default=6,
+                   help="worker당 미리 읽어둘 배치 수 (workers>0일 때만)")
     p.add_argument("--log_every", type=int, default=200)
     p.add_argument("--save_every", type=int, default=5000)
     p.add_argument("--milestone_every", type=int, default=50000,

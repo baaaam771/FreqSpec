@@ -14,14 +14,14 @@ REF=$RES/ref     # Stage 1이 채워둔 dense-50 reference (동일 seed/mask/dat
 
 # (a) deciding quantity — 먼저 실행. in_out_ratio>>1 & mask-restricted
 #     step-reduction curve가 가파르면 논문의 forward prediction 성립.
-python dit_inpaint_heterogeneity.py \
+python -u dit_inpaint_heterogeneity.py \
     --target $CKPT/target.pt --target_model DiT-S-Inp \
     --data_root $DATA_VA --n_traj 64 --batch 32 \
     --out $RES/heterogeneity
 
 # (b) EXACT mask-only (item 3), target-eps reuse (draft-free), c 스윕
 for C in 2 3 5; do
-  python dit_inpaint_sampler.py \
+  python -u dit_inpaint_sampler.py \
     --target $CKPT/target.pt --target_model DiT-S-Inp \
     --data_root $DATA_VA --mode dace --suffix cache \
     --region mask --budget mask_exact --selector mask --easy anchor \
@@ -33,7 +33,7 @@ done
 # (c) fixed-budget mask-restricted mask vs random (item 2, region=mask)
 for R in 0.2 0.3 0.5; do
   for SEL in mask random; do
-    python dit_inpaint_sampler.py \
+    python -u dit_inpaint_sampler.py \
       --target $CKPT/target.pt --target_model DiT-S-Inp \
       --data_root $DATA_VA --mode dace --suffix cache \
       --region mask --budget ratio --selector $SEL --easy anchor \
@@ -43,4 +43,4 @@ for R in 0.2 0.3 0.5; do
   done
 done
 
-python dit_inpaint_assemble.py --root $RES --out $RES/table_stage2 --by_bucket
+python -u dit_inpaint_assemble.py --root $RES --out $RES/table_stage2 --by_bucket

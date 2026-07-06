@@ -24,14 +24,14 @@ COMMON="--target $CKPT/target.pt --target_model DiT-S-Inp --data_root $DATA_VA \
 
 # ---- GLOBAL selectors (전체 token 점수; group A) ----
 for SEL in random freq delta oracle; do
-  python dit_inpaint_sampler.py $COMMON --region global --budget ratio \
+  python -u dit_inpaint_sampler.py $COMMON --region global --budget ratio \
     --selector $SEL --freq_src x0_anchor \
     --out_dir $RES/global_${SEL}
 done
 
 # ---- frequency SOURCE ablation (item 1): zt vs x0_anchor vs known ----
 for FS in zt x0_anchor known; do
-  python dit_inpaint_sampler.py $COMMON --region global --budget ratio \
+  python -u dit_inpaint_sampler.py $COMMON --region global --budget ratio \
     --selector freq --freq_src $FS \
     --out_dir $RES/global_freq_${FS}
 done
@@ -39,29 +39,29 @@ done
 # ---- WITHIN-MASK ranking ablation (item 13) ----
 # strict mask eligibility; combo 가중치로 ranking 신호만 바꿈.
 # within_mask_random : mask 안에서 무작위 (선택 자체 하한)
-python dit_inpaint_sampler.py $COMMON --region mask --budget ratio \
+python -u dit_inpaint_sampler.py $COMMON --region mask --budget ratio \
   --selector random --out_dir $RES/within_mask_random
 # within_mask_only : mask/boundary tie-break (mask 항은 상수라 사실상 tie-break)
-python dit_inpaint_sampler.py $COMMON --region mask --budget ratio \
+python -u dit_inpaint_sampler.py $COMMON --region mask --budget ratio \
   --selector mask --out_dir $RES/within_mask_only
 # within_mask_frequency : mask 안에서 frequency ranking
-python dit_inpaint_sampler.py $COMMON --region mask --budget ratio \
+python -u dit_inpaint_sampler.py $COMMON --region mask --budget ratio \
   --selector combo --cw_mask 0 --cw_bnd 0 --cw_freq 1 --cw_delta 0 \
   --freq_src x0_anchor --out_dir $RES/within_mask_frequency
 # within_mask_delta : mask 안에서 delta ranking
-python dit_inpaint_sampler.py $COMMON --region mask --budget ratio \
+python -u dit_inpaint_sampler.py $COMMON --region mask --budget ratio \
   --selector combo --cw_mask 0 --cw_bnd 0 --cw_freq 0 --cw_delta 1 \
   --out_dir $RES/within_mask_delta
 # within_mask_boundary_delta : frequency 없는 강한 기준 (mask+boundary eligible)
-python dit_inpaint_sampler.py $COMMON --region mask_plus_boundary --budget ratio \
+python -u dit_inpaint_sampler.py $COMMON --region mask_plus_boundary --budget ratio \
   --selection_boundary_k 2 --selector combo --cw_mask 0 --cw_bnd 1 --cw_freq 0 --cw_delta 1 \
   --out_dir $RES/within_mask_boundary_delta
 # within_mask_full_combo : frequency 추가 (핵심 비교의 다른 축)
-python dit_inpaint_sampler.py $COMMON --region mask_plus_boundary --budget ratio \
+python -u dit_inpaint_sampler.py $COMMON --region mask_plus_boundary --budget ratio \
   --selection_boundary_k 2 --selector combo --cw_mask 0 --cw_bnd 1 --cw_freq 1 --cw_delta 1 \
   --freq_src x0_anchor --out_dir $RES/within_mask_full_combo
 # within_mask_oracle : mask 안 상한
-python dit_inpaint_sampler.py $COMMON --region mask --budget ratio \
+python -u dit_inpaint_sampler.py $COMMON --region mask --budget ratio \
   --selector oracle --out_dir $RES/within_mask_oracle
 
-python dit_inpaint_assemble.py --root $RES --out $RES/table_stage3 --by_bucket
+python -u dit_inpaint_assemble.py --root $RES --out $RES/table_stage3 --by_bucket

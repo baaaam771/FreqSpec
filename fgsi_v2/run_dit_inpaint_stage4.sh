@@ -16,36 +16,36 @@ COMMON="--target $CKPT/target.pt --target_model DiT-S-Inp --data_root $DATA_VA \
         --batch 32 --ref_dir $REF"
 
 # ---- (item 14) cache x reinject 4-way ----
-python dit_inpaint_sampler.py $COMMON --mode dace --suffix cache \
+python -u dit_inpaint_sampler.py $COMMON --mode dace --suffix cache \
   --out_dir $RES/abl_cache_reinj
-python dit_inpaint_sampler.py $COMMON --mode dace --suffix cache --no_reinject \
+python -u dit_inpaint_sampler.py $COMMON --mode dace --suffix cache --no_reinject \
   --out_dir $RES/abl_cache_noreinj
-python dit_inpaint_sampler.py $COMMON --mode dace --suffix frozen \
+python -u dit_inpaint_sampler.py $COMMON --mode dace --suffix frozen \
   --out_dir $RES/abl_frozen_reinj
-python dit_inpaint_sampler.py $COMMON --mode dace --suffix frozen --no_reinject \
+python -u dit_inpaint_sampler.py $COMMON --mode dace --suffix frozen --no_reinject \
   --out_dir $RES/abl_frozen_noreinj
 
 # ---- (item 6) token-wise vs 2x2 vs 4x4 block-structured selection ----
 for BLK in 1 2 4; do
-  python dit_inpaint_sampler.py $COMMON --mode dace --suffix cache --block $BLK \
+  python -u dit_inpaint_sampler.py $COMMON --mode dace --suffix cache --block $BLK \
     --out_dir $RES/blockstruct_${BLK}
 done
 
 # ---- split depth m ----
 for M in 0 3 6; do
-  python dit_inpaint_sampler.py $COMMON --mode dace --suffix cache --split_m $M \
+  python -u dit_inpaint_sampler.py $COMMON --mode dace --suffix cache --split_m $M \
     --out_dir $RES/split_m${M}
 done
 
 # ---- (item 10) latency profiling ----
-python dit_inpaint_latency.py \
+python -u dit_inpaint_latency.py \
   --target $CKPT/target.pt --target_model DiT-S-Inp \
   --batches 1 4 8 16 --hard_ratio 0.3 --cache_period 2 --split_m 0 \
   --out $RES/latency
 
 # ---- (item 11) 3-seed final on the headline config (larger n) ----
 for S in 0 1 2; do
-  python dit_inpaint_sampler.py \
+  python -u dit_inpaint_sampler.py \
     --target $CKPT/target.pt --target_model DiT-S-Inp --data_root $DATA_VA \
     --mode dace --suffix cache --region mask --budget mask_exact \
     --selector mask --easy anchor --steps 30 --cache_period 2 --split_m 0 \
@@ -53,4 +53,4 @@ for S in 0 1 2; do
     --out_dir $RES/final_maskexact_seed$S
 done
 
-python dit_inpaint_assemble.py --root $RES --out $RES/table_stage4 --by_bucket
+python -u dit_inpaint_assemble.py --root $RES --out $RES/table_stage4 --by_bucket
