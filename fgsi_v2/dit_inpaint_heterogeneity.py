@@ -86,6 +86,8 @@ def dense_traj_change(args, target, sch, x0, y, mask, dev, seed):
 @torch.no_grad()
 def main(args):
     dev = torch.device(args.device)
+    if os.path.exists(os.path.join(args.out, "heterogeneity.json")) and not args.overwrite:
+        print(f"[skip] {args.out} already done (use --overwrite)"); return
     os.makedirs(args.out, exist_ok=True)
     sch = DDPMSchedule(num_train_timesteps=1000, beta_start=1e-4,
                        beta_end=0.02, beta_schedule="linear", device=dev)
@@ -205,6 +207,7 @@ def get_parser():
     p.add_argument("--run_seed", type=int, default=0)
     p.add_argument("--mask_seed", type=int, default=1234)
     p.add_argument("--data_seed", type=int, default=7)
+    p.add_argument("--overwrite", action="store_true")
     p.add_argument("--workers", type=int, default=0)
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")

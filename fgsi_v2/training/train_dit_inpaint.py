@@ -43,6 +43,54 @@ from utils.inpaint_masks import sample_masks
 from training.train_dit import get_loader, ema_update  # reuse loaders/EMA
 
 
+def atomic_save(obj, path):
+    """Write to a temp file then rename, so a crash mid-write never corrupts
+    the checkpoint (tmux 세션이 죽어도 마지막 저장본은 항상 온전)."""
+    tmp = path + ".tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def make_ckpt(model, ema, opt, step, args):
+    return {"model": model.state_dict(), "ema": ema.state_dict(),
+            "opt": opt.state_dict(), "step": step, "args": vars(args),
+            "torch_rng": torch.get_rng_state(),
+            "cuda_rng": (torch.cuda.get_rng_state_all()
+                         if torch.cuda.is_available() else None)}
+
+
+def try_resume(model, ema, opt, args, dev):
+    """Resume from --resume if given, else auto-resume from --out (or its
+    .last.pt) when it exists and --fresh was not passed. Returns start step."""
+    cand = []
+    if args.resume:
+        cand.append(args.resume)
+    if not args.fresh:
+        cand += [args.out, args.out + ".last.pt"]
+    for path in cand:
+        if path and os.path.exists(path):
+            ck = torch.load(path, map_location=dev)
+            model.load_state_dict(ck["model"])
+            ema.load_state_dict(ck["ema"] if "ema" in ck else ck["model"])
+            if "opt" in ck:
+                try:
+                    opt.load_state_dict(ck["opt"])
+                except Exception as e:
+                    print(f"[dit-inp] opt state skipped ({e})")
+            if ck.get("torch_rng") is not None:
+                torch.set_rng_state(ck["torch_rng"].to("cpu"))
+            if ck.get("cuda_rng") is not None and torch.cuda.is_available():
+                try:
+                    torch.cuda.set_rng_state_all(ck["cuda_rng"])
+                except Exception:
+                    pass
+            step = int(ck.get("step", 0))
+            print(f"[dit-inp] RESUME from {path} at step {step}/{args.steps}")
+            return step
+    print("[dit-inp] no checkpoint to resume; starting fresh")
+    return 0
+
+
 def main(args):
     dev = torch.device(args.device)
     sch = DDPMSchedule(num_train_timesteps=1000, beta_start=1e-4, beta_end=0.02,
@@ -75,7 +123,11 @@ def main(args):
 
     loader = get_loader(args)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    step = 0
+    step = try_resume(model, ema, opt, args, dev)
+    if step >= args.steps:
+        print(f"[dit-inp] already at/after target steps ({step}>={args.steps}); "
+              f"nothing to do. Use --fresh or raise --steps to continue.")
+        return
     model.train()
     while step < args.steps:
         for x, y in loader:
@@ -91,7 +143,6 @@ def main(args):
             eps = model(x_in, t, y, train=True)
 
             if target is None:
-                # target training: plain eps MSE, optionally hole-weighted
                 w = 1.0 + args.hole_weight * mask
                 loss = (w * (eps - noise) ** 2).mean()
             else:
@@ -112,14 +163,17 @@ def main(args):
             if step % args.log_every == 0:
                 print(f"[dit-inp] step {step}/{args.steps} loss {loss.item():.4f}")
             if step % args.save_every == 0 or step >= args.steps:
-                torch.save({"model": model.state_dict(),
-                            "ema": ema.state_dict(),
-                            "args": vars(args), "step": step}, args.out)
+                ck = make_ckpt(model, ema, opt, step, args)
+                atomic_save(ck, args.out)                 # canonical
+                atomic_save(ck, args.out + ".last.pt")    # resume anchor
+            if args.milestone_every and step % args.milestone_every == 0:
+                atomic_save(make_ckpt(model, ema, opt, step, args),
+                            f"{args.out}.step{step}.pt")
             if step >= args.steps:
                 break
-    torch.save({"model": model.state_dict(), "ema": ema.state_dict(),
-                "args": vars(args), "step": step}, args.out)
-    print(f"[dit-inp] saved {args.out}")
+    atomic_save(make_ckpt(model, ema, opt, step, args), args.out)
+    atomic_save(make_ckpt(model, ema, opt, step, args), args.out + ".last.pt")
+    print(f"[dit-inp] saved {args.out} (step {step})")
 
 
 def get_parser():
@@ -157,6 +211,15 @@ def get_parser():
                         "0 is the safe default on the server")
     p.add_argument("--log_every", type=int, default=200)
     p.add_argument("--save_every", type=int, default=5000)
+    p.add_argument("--milestone_every", type=int, default=50000,
+                   help="also keep a permanent snapshot out.stepN.pt every N "
+                        "steps (0 disables); out.pt / out.pt.last.pt are "
+                        "always overwritten for resume")
+    p.add_argument("--resume", type=str, default="",
+                   help="explicit checkpoint to resume from; default is "
+                        "auto-resume from --out / --out.last.pt if present")
+    p.add_argument("--fresh", action="store_true",
+                   help="ignore any existing checkpoint and start from step 0")
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
     return p

@@ -316,6 +316,11 @@ def _agg(recs):
 @torch.no_grad()
 def main(args):
     dev = torch.device(args.device)
+    done_flag = os.path.join(args.out_dir, "metrics.json")
+    if os.path.exists(done_flag) and not args.overwrite:
+        print(f"[skip] {args.out_dir} already has metrics.json "
+              f"(use --overwrite to redo)")
+        return
     os.makedirs(args.out_dir, exist_ok=True)
     png_dir = os.path.join(args.out_dir, "png"); os.makedirs(png_dir, exist_ok=True)
     if args.ref_dir:
@@ -478,6 +483,10 @@ def get_parser():
     p.add_argument("--no_reinject", action="store_true",
                    help="disable known-region re-injection (ablation item 14; "
                         "the reference still re-injects)")
+    p.add_argument("--overwrite", action="store_true",
+                   help="recompute even if out_dir/metrics.json exists "
+                        "(default: skip completed runs so a killed sweep "
+                        "resumes where it stopped)")
     p.add_argument("--save_debug_grid", action="store_true", default=True)
     p.add_argument("--workers", type=int, default=0)
     p.add_argument("--device", type=str,
