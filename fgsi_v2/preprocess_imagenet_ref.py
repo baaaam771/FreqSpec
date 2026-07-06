@@ -35,17 +35,26 @@ def center_crop_resize(img, size):
 
 def iter_parquet(raw_dir):
     import pyarrow.parquet as pq
-    files = sorted(glob.glob(os.path.join(raw_dir, "**", "*.parquet"),
+    # validation shards only (repo also contains test/train parquets)
+    files = sorted(glob.glob(os.path.join(raw_dir, "**", "validation-*.parquet"),
                              recursive=True))
+    if not files:  # fallback: any parquet
+        files = sorted(glob.glob(os.path.join(raw_dir, "**", "*.parquet"),
+                                 recursive=True))
     for pf in files:
         t = pq.read_table(pf)
-        col = "image" if "image" in t.column_names else t.column_names[0]
-        for rec in t.column(col):
+        cols = t.column_names
+        icol = "image" if "image" in cols else cols[0]
+        lcol = "label" if "label" in cols else None
+        imgs = t.column(icol)
+        labs = t.column(lcol) if lcol else [None] * len(imgs)
+        for rec, lab in zip(imgs, labs):
             d = rec.as_py()
+            y = lab.as_py() if lab is not None else None
             if isinstance(d, dict) and "bytes" in d:
-                yield Image.open(io.BytesIO(d["bytes"]))
+                yield Image.open(io.BytesIO(d["bytes"])), y
             elif isinstance(d, (bytes, bytearray)):
-                yield Image.open(io.BytesIO(d))
+                yield Image.open(io.BytesIO(d)), y
 
 
 def iter_images(raw_dir):
@@ -55,7 +64,7 @@ def iter_images(raw_dir):
         files += glob.glob(os.path.join(raw_dir, "**", e), recursive=True)
     for fp in sorted(files):
         try:
-            yield Image.open(fp)
+            yield Image.open(fp), None
         except Exception:
             continue
 
@@ -69,7 +78,8 @@ def main(args):
     print(f"[prep] source: {'parquet' if has_parquet else 'image files'}")
 
     n = 0
-    for img in src:
+    labels = []
+    for img, y in src:
         if n >= args.num:
             break
         try:
@@ -80,9 +90,15 @@ def main(args):
         except Exception as e:
             print(f"[prep] skip {n}: {e}")
             continue
+        labels.append(y if y is not None else -1)
         n += 1
         if n % 2000 == 0:
             print(f"[prep] {n}/{args.num}")
+    if any(l >= 0 for l in labels):
+        with open(os.path.join(os.path.dirname(args.out256),
+                               "imagenet_val_labels.txt"), "w") as f:
+            f.write("\n".join(str(l) for l in labels))
+        print(f"[prep] wrote labels for {len(labels)} images")
     print(f"[prep] wrote {n} images to {args.out256} and {args.out512}")
 
 

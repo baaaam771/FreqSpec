@@ -19,9 +19,9 @@ RAW=$DEST/imagenet_val_raw
 export HF_HOME=${HF_HOME:-$DEST/hf_cache}
 
 echo "=== 1. download ImageNet-1k validation split (~6.3 GB) ==="
-# only the validation parquet shards, not the 150GB train set
+# validation parquet shards only (real names: validation-00000-of-00014.parquet)
 hf download ILSVRC/imagenet-1k --repo-type dataset \
-  --include "data/val_images*" \
+  --include "data/validation-*.parquet" \
   --local-dir $RAW
 
 echo "=== 2. extract + preprocess to 256 and 512 ==="
