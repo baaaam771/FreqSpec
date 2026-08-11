@@ -24,16 +24,19 @@
 # Usage:  ./run_sensitivity_sweep.sh            # all axes
 #         ./run_sensitivity_sweep.sh K          # one axis (K|patch|blend|drift|interior|x0gate|center)
 set -euo pipefail
+grep -q "fs_presets" baseline_sweep.py || { echo "ERROR: baseline_sweep.py is not v2+"; exit 1; }
 
 # ================= EDIT HERE =================
 TARGET_ID="/mnt/HDD_12TB/bam_ki/checkpoints/stable-diffusion-xl-1.0-inpainting-0.1"
-DRAFT_CKPT="/mnt/HDD_12TB/bam_ki/runs/sdxl_v1/draft_final.pt"     # COCO draft
+DRAFT_CKPT="/mnt/HDD_12TB/bam_ki/runs/sdxl_coco_v2/draft_coco_400k.pt"   # COCO 400k draft
 DATA_ROOT="/mnt/HDD_12TB/bam_ki/datasets/coco2017/val2017"
 CAPTION_JSON="/mnt/HDD_12TB/bam_ki/datasets/coco2017/annotations/captions_val2017.json"
-INDOMAIN_RUN="/mnt/HDD_12TB/bam_ki/results/qualitative_coco_run100"
+INDOMAIN_RUN="/mnt/HDD_12TB/bam_ki/results/main_coco_400k"   # Phase-2 dir (run AFTER phase2)
 OUT_BASE="/mnt/HDD_12TB/bam_ki/results/sens_coco"
 NUM_IMAGES=50
 # =============================================
+[[ -f "${DRAFT_CKPT}" ]] || { echo "ERROR: draft ckpt missing: ${DRAFT_CKPT}"; exit 1; }
+[[ -d "${INDOMAIN_RUN}" ]] || { echo "ERROR: Phase-2 dir missing: ${INDOMAIN_RUN} — run run_phase2_remeasure.sh first"; exit 1; }
 
 # Combo 2 center values
 C_K=3; C_PATCH=4; C_BLEND=0.10; C_DRIFT=0.006; C_INTERIOR=0.5

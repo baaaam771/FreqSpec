@@ -121,5 +121,9 @@ else
 fi
 
 echo ""
+echo "[phase2] SAFETY: verify manifest identity for reused targets:"
+echo "  python verify_manifests.py --new ${RESULTS_ROOT}/main_places2_400k/manifest.json --old ${RESULTS_ROOT}/qualitative_places2_run100/manifest.json"
+echo "  python verify_manifests.py --new ${RESULTS_ROOT}/main_coco_400k/manifest.json --old ${RESULTS_ROOT}/qualitative_coco_run100/manifest.json"
+echo ""
 echo "[phase2] done. Old run100 dirs (200k/290k drafts) are preserved —"
 echo "[phase2] use them with collect_sweep_metrics for the training-budget table."
