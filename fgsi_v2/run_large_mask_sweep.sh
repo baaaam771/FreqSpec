@@ -13,6 +13,7 @@
 # Usage:  ./run_large_mask_sweep.sh            # all 3 datasets
 #         ./run_large_mask_sweep.sh coco       # one dataset
 set -euo pipefail
+grep -q "default_prompt" baseline_sweep.py || { echo "ERROR: baseline_sweep.py is not v3"; exit 1; }
 
 # ================= EDIT HERE =================
 TARGET_ID="/mnt/HDD_12TB/bam_ki/checkpoints/stable-diffusion-xl-1.0-inpainting-0.1"
@@ -29,9 +30,9 @@ declare -A CAPTION_JSON=(
   [coco]="/mnt/HDD_12TB/bam_ki/datasets/coco2017/annotations/captions_val2017.json"
 )
 declare -A DRAFT_CKPT=(
-  [ffhq]="/mnt/HDD_12TB/bam_ki/runs/sdxl_v1_ffhq/draft_final.pt"
-  [places2]="/mnt/HDD_12TB/bam_ki/runs/sdxl_v1/draft_step0290000.pt"
-  [coco]="/mnt/HDD_12TB/bam_ki/runs/sdxl_v1_coco/draft_final.pt"
+  [ffhq]="/mnt/HDD_12TB/bam_ki/runs/sdxl_ffhq_v1/draft_ffhq_400k.pt"
+  [places2]="/mnt/HDD_12TB/bam_ki/runs/sdxl_v1/draft_places2_400k.pt"
+  [coco]="/mnt/HDD_12TB/bam_ki/runs/sdxl_coco_v2/draft_coco_400k.pt"
 )
 NUM_IMAGES=50
 COV_LO=0.40
@@ -51,8 +52,10 @@ run_ds () {
   if [[ -n "${CAPTION_JSON[${DS}]}" ]]; then
     CAP_ARG="--caption_json ${CAPTION_JSON[${DS}]}"
     PROMPT_ARG=""
+  elif [[ "${DS}" == "ffhq" ]]; then
+    PROMPT_ARG="--default_prompt \"a photo of a person\""
   fi
-  python baseline_sweep.py \
+  eval python baseline_sweep.py \
     --target_id "${TARGET_ID}" \
     --draft_ckpt "${DRAFT_CKPT[${DS}]}" \
     --use_ema_draft \

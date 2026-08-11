@@ -20,6 +20,7 @@
 #     ./run_cross_dataset_sweep.sh            # run all 6 off-diagonal
 #     ./run_cross_dataset_sweep.sh ffhq coco  # run one cell: coco-draft on ffhq data
 set -euo pipefail
+grep -q "default_prompt" baseline_sweep.py || { echo "ERROR: baseline_sweep.py is not v3"; exit 1; }
 
 # ================= EDIT HERE: paths =================
 TARGET_ID="/mnt/HDD_12TB/bam_ki/checkpoints/stable-diffusion-xl-1.0-inpainting-0.1"
@@ -40,15 +41,17 @@ declare -A CAPTION_JSON=(
 )
 # Draft checkpoints per TRAINING domain  << EDIT to actual paths
 declare -A DRAFT_CKPT=(
-  [ffhq]="/mnt/HDD_12TB/bam_ki/runs/sdxl_v1_ffhq/draft_final.pt"
-  [places2]="/mnt/HDD_12TB/bam_ki/runs/sdxl_v1/draft_step0290000.pt"   # or draft_step0400000.pt when ready
-  [coco]="/mnt/HDD_12TB/bam_ki/runs/sdxl_v1_coco/draft_final.pt"
+  [ffhq]="/mnt/HDD_12TB/bam_ki/runs/sdxl_ffhq_v1/draft_ffhq_400k.pt"
+  [places2]="/mnt/HDD_12TB/bam_ki/runs/sdxl_v1/draft_places2_400k.pt"
+  [coco]="/mnt/HDD_12TB/bam_ki/runs/sdxl_coco_v2/draft_coco_400k.pt"
 )
 # Existing in-domain sweeps (for target-dir reuse)
+# Target reuse source = Phase-2 dirs (run AFTER run_phase2_remeasure.sh:
+# their targets use the CORRECTED prompt pipeline, esp. FFHQ)
 declare -A INDOMAIN_RUN=(
-  [ffhq]="${RESULTS_ROOT}/qualitative_ffhq_run100"
-  [places2]="${RESULTS_ROOT}/qualitative_places2_run100"
-  [coco]="${RESULTS_ROOT}/qualitative_coco_run100"
+  [ffhq]="${RESULTS_ROOT}/main_ffhq_400k"
+  [places2]="${RESULTS_ROOT}/main_places2_400k"
+  [coco]="${RESULTS_ROOT}/main_coco_400k"
 )
 NUM_IMAGES=100          # must match run100 for manifest/idx alignment
 FS_PRESETS="strict,default"
@@ -86,9 +89,12 @@ run_cell () {
   if [[ -n "${CAPTION_JSON[${EVAL_DS}]}" ]]; then
     CAP_ARG="--caption_json ${CAPTION_JSON[${EVAL_DS}]}"
     PROMPT_ARG=""
+  elif [[ "${EVAL_DS}" == "ffhq" ]]; then
+    # FFHQ: training used default_prompt, not path-derived prompts
+    PROMPT_ARG="--default_prompt \"a photo of a person\""
   fi
 
-  python baseline_sweep.py \
+  eval python baseline_sweep.py \
     --target_id "${TARGET_ID}" \
     --draft_ckpt "${DRAFT_CKPT[${DRAFT_DS}]}" \
     --use_ema_draft \
