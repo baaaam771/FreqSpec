@@ -8,7 +8,11 @@
 # on all 3 datasets. Note: target baselines CANNOT be reused here (masks
 # differ from run100), so target_s50 / target_s30 are recomputed.
 #
-# COST: 3 datasets x (2 targets + 2 presets) x 50 imgs x ~40s = ~13 h.
+# COST: 3 datasets x (5 targets + 2 presets) x 50 imgs = ~16-18 h.
+# Brackets extended BELOW 30 steps on purpose: Phase 2 showed reduced-step
+# quality is flat in the 30-50 range on training-distribution masks; the
+# decisive question is whether it BREAKS on hard workloads (large /
+# instance masks) while verification holds quality. s24/s20 map that.
 #
 # Usage:  ./run_large_mask_sweep.sh            # all 3 datasets
 #         ./run_large_mask_sweep.sh coco       # one dataset
@@ -64,7 +68,7 @@ run_ds () {
     --out_root "${OUT}" \
     --num_images "${NUM_IMAGES}" \
     --image_size 1024 \
-    --target_steps 50 30 \
+    --target_steps 50 40 30 24 20 \
     --fs_presets strict,default \
     --resume \
     --mask_mode large \

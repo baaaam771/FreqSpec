@@ -8,7 +8,8 @@
 # deterministically chosen per image seed. Targets cannot be reused
 # (masks differ from all other runs) — s50/s30 computed fresh.
 #
-# COST: (2 targets + 2 presets) x 50 imgs x ~30-40s  =~ 4-5 h.
+# COST: (5 targets + 2 presets) x 50 imgs =~ 6-7 h.
+# Brackets extended below 30 steps — see run_large_mask_sweep.sh header.
 #
 # REQUIRES: baseline_sweep.py = patched v4.
 set -euo pipefail
@@ -35,7 +36,7 @@ python baseline_sweep.py \
   --out_root "${OUT}" \
   --num_images "${NUM_IMAGES}" \
   --image_size 1024 \
-  --target_steps 50 30 \
+  --target_steps 50 40 30 24 20 \
   --fs_presets strict,default \
   --resume \
   --mask_mode coco_object \
