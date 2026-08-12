@@ -128,6 +128,21 @@ def extract_features(target, draft, sch, dwt, item, args, device):
         x0b = (z_t2 - (1 - ab).sqrt() * e2) / ab.sqrt()
         feats["selfcons_t70"] = float(
             (((x0_cache[0.7] - x0b).abs() * inside).sum() / n_in).item())
+    # 선택: 1-target-call probe — s8 실행의 첫 step에 재사용 가능한 단 한 번의
+    # target 호출로 draft x̂0(t90)와의 불일치를 측정 (마지막 남은 신호 후보)
+    if getattr(args, "target_probe", False):
+        cond_emb, uncond_emb = bs._get_emb(target, item, args, z0)
+        with torch.no_grad():
+            z1, _ = bs.baseline_inpaint(
+                target, z_init.clone(), cond_z, mask_z, sch,
+                num_inference_steps=1, guidance_scale=args.guidance_scale,
+                cond_emb=cond_emb, uncond_emb=uncond_emb,
+                known_z=z0, blend_known=True)
+        dis = (z1.to(pdtype) - x0_cache[0.9]).abs()
+        feats["tgt1_disagree_in"] = float(
+            ((dis * inside).sum() / n_in).item())
+        feats["tgt1_disagree_bnd"] = float(
+            ((dis * band).sum() / band.sum().clamp(min=1)).item())
     feats["probe_time_sec"] = time.time() - t0
     return feats
 
@@ -235,6 +250,9 @@ def main():
     p.add_argument("--label_hard", type=str, default="target_s12")
     p.add_argument("--label_ref", type=str, default="target_s24")
     p.add_argument("--tau", type=float, default=0.02)
+    p.add_argument("--target_probe", action="store_true",
+                   help="1-target-call disagreement feature 추가 "
+                        "(비용 ~1 target step, 실제 실행 첫 step에 재사용 가능)")
     p.add_argument("--analyze_only", action="store_true")
     args = p.parse_args()
 
