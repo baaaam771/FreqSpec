@@ -21,13 +21,20 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
-# ---- EXAMPLES (run, idx, short row label) : chosen from the CSVs ------------
+# ---- EXAMPLES (run, idx, short row label) : one pick per row ----------------
+#   Chosen from the per-image CSVs. Numbers = GT-m(s50 / s16 / s8), Δ8 = s8-s24.
+#   Alternatives are listed in comments — swap the idx if the image looks better.
 EXAMPLES = [
-    ("largemask_coco",     32, "large / COCO"),
-    ("largemask_ffhq",     27, "large / FFHQ"),
-    ("largemask_places2",  44, "large / Places2"),
-    ("objectremoval_coco", 17, "instance (s8 fails)"),
-    ("objectremoval_coco", 14, "instance (s8 ok)"),
+    # large / COCO  : s16 fine (0.503), s8 COLLAPSES (0.788, Δ8 +0.289)
+    ("largemask_coco",     32, "large / COCO"),      # alt: 37, 49, 31, 20
+    # large / FFHQ  : face collapse — s50 0.464, s16 0.467, s8 0.782 (Δ8 +0.322)
+    ("largemask_ffhq",     27, "large / FFHQ"),      # alt: 19, 9, 21, 23
+    # large / Places2: scene — s50 0.279, s16 0.271, s8 0.547 (Δ8 +0.269)
+    ("largemask_places2",  44, "large / Places2"),   # alt: 37, 25, 23, 12
+    # instance, s8 FAILS : s50 0.698, s16 0.660, s8 0.763 (Δ8 +0.101)
+    ("objectremoval_coco", 17, "instance (s8 fails)"), # alt: 20, 35, 3, 38
+    # instance, s8 OK (contrast → heterogeneity): s8 0.740 (Δ8 -0.037)
+    ("objectremoval_coco", 14, "instance (s8 ok)"),  # alt: 40, 33, 46, 16
 ]
 
 # ---- COLUMNS : (header, kind, method) --------------------------------------
