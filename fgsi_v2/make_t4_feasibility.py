@@ -123,10 +123,12 @@ def main():
             perseed=[]
             for sd_ in sorted(x for x in ns["seed"].dropna().unique())[:3]:
                 d=ns[ns["seed"]==sd_]
-                gs =d[d["method"]==f"target_{step}"].set_index("idx")["gt_masked_lpips"]
-                g24=d[d["method"]=="target_s24"].set_index("idx")["gt_masked_lpips"]
+                # collapse any duplicate (idx) per method to one value (mean) before pairing
+                gs =d[d["method"]==f"target_{step}"].groupby("idx")["gt_masked_lpips"].mean()
+                g24=d[d["method"]=="target_s24"].groupby("idx")["gt_masked_lpips"].mean()
                 j=gs.index.intersection(g24.index); j=j[j<30]
-                perseed.append(set(j[(gs.loc[j]-g24.loc[j]>TAU).values]))
+                diff=(gs.reindex(j)-g24.reindex(j))
+                perseed.append(set(j[(diff>TAU).values]))
             import itertools as _it
             J=[len(a&b)/max(len(a|b),1) for a,b in _it.combinations(perseed,2)]
             cnts=[len(x) for x in perseed]
