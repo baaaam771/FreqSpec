@@ -79,52 +79,58 @@ def main():
         hr=[r[2] for r in oracle_rows]
         lines.append(f"% oracle headroom range: {min(hr)*100:.0f}%..{max(hr)*100:.0f}% (locked 17-28%)")
 
-    # ---- probe (instmask v3) ----
-    probe=rd("probe_instmask_v3.csv"); prob_auroc=prob_aupr=cov_auroc=base=np.nan
+    # ---- probe (instmask v3): label from instmask per-image GT-m(s8)-GT-m(s16) ----
+    probe=rd("probe_instmask_v3.csv"); prob_auroc=prob_aupr=cov_auroc=base=np.nan; pcost=np.nan
     if probe is not None:
-        # label: GT-m(s8)-GT-m(s16)>0.02 on instmask
-        inst=per[per["run"].astype(str).str.contains("inst")]
-        g8=gtm(inst,inst["run"].iloc[0],"s8") if len(inst) else None
-        # fallback: derive label from probe file if it carries gt columns
-        if "label" in probe.columns:
-            y=probe["label"].values
-        elif {"gtm_s8","gtm_s16"}.issubset(probe.columns):
-            y=((probe["gtm_s8"]-probe["gtm_s16"])>TAU).astype(int).values
+        # instance-mask per-image source for the label
+        inst=per[per["run"].astype(str).str.contains("inst|object")]
+        g8 =inst[inst["method"]=="target_s8" ].set_index(["run","idx"])["gt_masked_lpips"]
+        g16=inst[inst["method"]=="target_s16"].set_index(["run","idx"])["gt_masked_lpips"]
+        lab=((g8-g16)>TAU).astype(int)                     # index (run,idx)
+        pr=probe.copy()
+        # join label onto probe rows by (run,idx) if runs match, else by idx
+        labd=lab.to_dict()                                 # {(run,idx): 0/1}
+        if set(zip(pr["run"],pr["idx"])) & set(labd.keys()):
+            pr["label"]=[labd.get((r,i),np.nan) for r,i in zip(pr["run"],pr["idx"])]
         else:
-            y=None
-        if y is not None and "idx" in probe.columns:
-            test=(probe["idx"].values%2==1); train=~test
-            feat=[c for c in probe.columns if c not in
-                  ("run","idx","method","label","gtm_s8","gtm_s16","time_sec")]
-            X=probe[feat].values.astype(float)
+            labi=lab.groupby(level=1).max().to_dict()        # {idx: 0/1}
+            pr["label"]=[labi.get(i,np.nan) for i in pr["idx"]]
+        pr=pr.dropna(subset=["label"]); y=pr["label"].astype(int).values
+        drop={"run","idx","label","mask_coverage","probe_time_sec"}
+        feats=[c for c in pr.columns if c not in drop]
+        X=pr[feats].values.astype(float)
+        test=(pr["idx"].values%2==1); train=~test
+        if train.sum()>5 and test.sum()>2 and len(set(y[test]))==2:
             w,mu,sd=logistic_fit(X[train], y[train])
-            Xt=np.c_[np.ones(test.sum()), (X[test]-mu[1:])/(sd[1:]) ]
+            Xt=np.c_[np.ones(test.sum()), (X[test]-mu[1:])/(sd[1:])]
             score=1/(1+np.exp(-Xt@w))
-            prob_auroc=auroc(y[test],score); prob_aupr=auprc(y[test],score)
-            base=y[test].mean()
-            if "mask_coverage" in probe.columns:
-                cov_auroc=auroc(y[test], probe["mask_coverage"].values[test])
+            prob_auroc=auroc(y[test],score); prob_aupr=auprc(y[test],score); base=y[test].mean()
+            if "mask_coverage" in pr.columns:
+                cov_auroc=auroc(y[test], pr["mask_coverage"].values[test])
+        pcost=pr["probe_time_sec"].median() if "probe_time_sec" in pr.columns else np.nan
         lines.append(f"% probe test AUROC={prob_auroc:.3f} (locked .591), coverage={cov_auroc:.3f} (.584), "
-                     f"AUPRC={prob_aupr:.3f} (.554), base={base:.3f} (.44)")
+                     f"AUPRC={prob_aupr:.3f} (.554), base={base:.3f} (.44), cost={pcost:.3f}s (.081)")
 
-    # ---- repeatability (nsrep) ----
+    # ---- repeatability: seed encoded in run name suffix _nsN ----
+    import re as _re
     def jacc_report(nsfile, tag):
         ns=rd(nsfile)
-        if ns is None or "seed" not in (ns.columns if ns is not None else []):
-            lines.append(f"% {tag}: needs 'seed' column in {nsfile} -- VERIFY")
-            return
-        out=[]
+        if ns is None: lines.append(f"% {tag}: {nsfile} missing"); return
+        ns=ns.copy()
+        ns["base"]=ns["run"].map(lambda r: _re.sub(r"_ns\d+$","",str(r)))
+        ns["seed"]=ns["run"].map(lambda r: (_re.search(r"_ns(\d+)$",str(r)) or [None,None])[1])
         for step in ["s12","s8"]:
-            sets=[]
-            for sd_ in sorted(ns["seed"].unique())[:3]:
-                d=ns[(ns["seed"]==sd_)]
-                gs=d[d["method"]==f"target_{step}"].set_index("idx")["gt_masked_lpips"]
+            perseed=[]
+            for sd_ in sorted(x for x in ns["seed"].dropna().unique())[:3]:
+                d=ns[ns["seed"]==sd_]
+                gs =d[d["method"]==f"target_{step}"].set_index("idx")["gt_masked_lpips"]
                 g24=d[d["method"]=="target_s24"].set_index("idx")["gt_masked_lpips"]
                 j=gs.index.intersection(g24.index); j=j[j<30]
-                sets.append(set(j[(gs.loc[j]-g24.loc[j]>TAU).values]))
-            J=[len(a&b)/max(len(a|b),1) for a,b in itertools.combinations(sets,2)]
-            out.append((step, np.mean(J) if J else np.nan))
-        lines.append(f"% {tag} Jaccard: "+", ".join(f"{s}={v:.2f}" for s,v in out))
+                perseed.append(set(j[(gs.loc[j]-g24.loc[j]>TAU).values]))
+            import itertools as _it
+            J=[len(a&b)/max(len(a|b),1) for a,b in _it.combinations(perseed,2)]
+            cnts=[len(x) for x in perseed]
+            lines.append(f"% {tag} {step}: Jaccard {np.mean(J):.2f} (pairs {[f'{x:.2f}' for x in J]}), fail-counts {cnts}")
     jacc_report("nsrep_per_image.csv","nsrep(large)")
     jacc_report("nsrep_obj_per_image.csv","nsrep(obj)")
 
@@ -140,7 +146,7 @@ def main():
         f.write(f"Probe combo AUROC (test) & {prob_auroc:.3f} \\\\\n")
         f.write(f"Coverage baseline AUROC & {cov_auroc:.3f} \\\\\n")
         f.write(f"Probe AUPRC / base rate & {prob_aupr:.3f} / {base:.2f} \\\\\n")
-        f.write("Probe cost & 0.081\\,s~\\VERIFY{} \\\\\n")
+        f.write(f"Probe cost & {pcost:.3f}\\,s \\\\\n")
         f.write("\\bottomrule\n\\end{tabular}\n\\end{table}\n")
     print("wrote table_t4_feasibility.tex")
     print("\n".join(["=== CROSS-CHECK (compare to locked numbers) ==="]+lines))
