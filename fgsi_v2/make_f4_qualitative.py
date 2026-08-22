@@ -48,15 +48,20 @@ COLUMNS = [
     ("s8 (6x)", "gen",   "target_s8"),
     ("strict",  "gen",   "freqspec_strict"),
     ("default", "gen",   "freqspec_default"),
-    # ("usage",  "usage", "freqspec_default"),   # uncomment if you saved usage maps
+    ("usage",  "usage", "freqspec_default"),   # usage maps exist in freqspec_* folders
 ]
 
-# ====== EDIT THESE PATH PATTERNS TO MATCH YOUR STORAGE =======================
-# available placeholders: {root} {run} {idx} {idx04} {method}
-INPUT_PATTERN = "{root}/{run}/input_{idx04}.png"
-MASK_PATTERN  = "{root}/{run}/mask_{idx04}.png"
-GEN_PATTERN   = "{root}/{run}/{method}/{idx04}.png"
-USAGE_PATTERN = "{root}/{run}/{method}/usage_{idx04}.png"
+# ====== PATH PATTERNS — matched to the server layout ========================
+#   /mnt/HDD_12TB/bam_ki/results/<run>/<method>/img_<idx:03d>/{gt,mask,out}.png
+#   gt/mask are identical across methods (hash-verified); usage_map.png exists
+#   ONLY in freqspec_* folders. idx is 3-digit zero-padded (img_032).
+#   placeholders available: {root} {run} {idx} {idx03} {method}
+INPUT_PATTERN = "{root}/{run}/target_s50/img_{idx03}/gt.png"    # GT (same for all methods)
+MASK_PATTERN  = "{root}/{run}/target_s50/img_{idx03}/mask.png"  # mask (same for all methods)
+GEN_PATTERN   = "{root}/{run}/{method}/img_{idx03}/out.png"
+USAGE_PATTERN = "{root}/{run}/{method}/img_{idx03}/usage_map.png"  # freqspec_* only
+# default --img_root:
+DEFAULT_ROOT  = "/mnt/HDD_12TB/bam_ki/results"
 # ============================================================================
 
 def load_gm(data_dir):
@@ -69,7 +74,7 @@ def load_gm(data_dir):
     return df.set_index(["run","method","idx"])["gt_masked_lpips"]
 
 def resolve(kind, run, idx, method, root):
-    d=dict(root=root, run=run, idx=idx, idx04=f"{idx:04d}", method=method)
+    d=dict(root=root, run=run, idx=idx, idx03=f"{idx:03d}", method=method)
     pat={"input":INPUT_PATTERN,"mask":MASK_PATTERN,"gen":GEN_PATTERN,"usage":USAGE_PATTERN}[kind]
     return pat.format(**d)
 
@@ -83,7 +88,7 @@ def load_img(path):
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--data", default=".")
-    ap.add_argument("--img_root", default="./samples", help="root dir of generated images")
+    ap.add_argument("--img_root", default=DEFAULT_ROOT, help="root dir of generated images")
     args=ap.parse_args()
     gm=load_gm(args.data)
 
@@ -98,6 +103,10 @@ def main():
     for r,(run,idx,rlab) in enumerate(EXAMPLES):
         for c,(hdr,kind,method) in enumerate(COLUMNS):
             ax=axes[r,c]; ax.set_xticks([]); ax.set_yticks([])
+            if kind=="usage" and not str(method).startswith("freqspec"):
+                ax.axis("off");  # no usage map for target_* methods
+                if r==0: ax.set_title(hdr, fontsize=8)
+                continue
             path=resolve(kind,run,idx,method,args.img_root)
             im=load_img(path)
             if im is None:
